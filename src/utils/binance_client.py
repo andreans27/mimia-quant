@@ -1,14 +1,23 @@
 """
 Binance REST API Client for Mimia Quant Trading System.
-Uses python-binance library with testnet support.
+Uses official binance-connector-python library (binance-sdk-derivatives-trading-usds-futures).
 """
 
 import os
-from typing import Optional, Dict, Any, List
-from binance.client import Client
-from binance.exceptions import BinanceAPIException
+import sys
+from typing import Optional, Dict, Any, List, Union
 
-# Enum equivalents (since binance 1.0.36 doesn't have enums module)
+# Add the venv site-packages to path if needed
+sys.path.insert(0, '/root/.hermes/hermes-agent/venv/lib/python3.11/site-packages')
+
+from binance_sdk_derivatives_trading_usds_futures import (
+    DerivativesTradingUsdsFutures,
+    DERIVATIVES_TRADING_USDS_FUTURES_REST_API_TESTNET_URL,
+    DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL,
+)
+from binance_common.configuration import ConfigurationRestAPI
+
+# Order constants
 ORDER_SIDE_BUY = "BUY"
 ORDER_SIDE_SELL = "SELL"
 ORDER_TYPE_LIMIT = "LIMIT"
@@ -22,88 +31,113 @@ POSITION_SIDE_SHORT = "SHORT"
 TIME_IN_FORCE_GTC = "GTC"
 TIME_IN_FORCE_IOC = "IOC"
 TIME_IN_FORCE_FOK = "FOK"
-ORDER_RESP_TYPE_ACK = "ACK"
-ORDER_RESP_TYPE_RESULT = "RESULT"
-ORDER_RESP_TYPE_FULL = "FULL"
 
 
 class BinanceRESTClient:
     """
-    Binance Futures REST API client with testnet support.
-    Provides methods for account info, order management, and market data.
+    Binance Futures REST API client using official binance-connector-python.
+    Supports both testnet and production environments.
     """
-    
+
     def __init__(
         self,
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
-        testnet: bool = True,
-        testnet_api_key: Optional[str] = None,
-        testnet_api_secret: Optional[str] = None
+        testnet: bool = True
     ):
         """
         Initialize Binance REST client.
-        
+
         Args:
-            api_key: Binance API key (or env BINANCE_API_KEY)
-            api_secret: Binance API secret (or env BINANCE_API_SECRET)
+            api_key: Binance API key
+            api_secret: Binance API secret
             testnet: Use testnet (default True)
-            testnet_api_key: Testnet API key (or env BINANCE_TESTNET_API_KEY)
-            testnet_api_secret: Testnet API secret (or env BINANCE_TESTNET_API_SECRET)
         """
         self.testnet = testnet
-        
+
         # Get credentials from env if not provided
         if testnet:
-            self.api_key = testnet_api_key or os.getenv("BINANCE_TESTNET_API_KEY", "")
-            self.api_secret = testnet_api_secret or os.getenv("BINANCE_TESTNET_API_SECRET", "")
-            self.base_url = "https://testnet.binancefuture.com"
-            self.client = Client(self.api_key, self.api_secret, testnet=True)
+            self.api_key = api_key or os.getenv("BINANCE_TESTNET_API_KEY", "")
+            self.api_secret = api_secret or os.getenv("BINANCE_TESTNET_API_SECRET", "")
+            base_url = DERIVATIVES_TRADING_USDS_FUTURES_REST_API_TESTNET_URL
         else:
             self.api_key = api_key or os.getenv("BINANCE_API_KEY", "")
             self.api_secret = api_secret or os.getenv("BINANCE_API_SECRET", "")
-            self.base_url = "https://fapi.binance.com"
-            self.client = Client(self.api_key, self.api_secret)
-    
+            base_url = DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL
+
+        # Create configuration and client
+        config = ConfigurationRestAPI(
+            api_key=self.api_key,
+            api_secret=self.api_secret,
+            base_path=base_url,
+        )
+        self._client = DerivativesTradingUsdsFutures(config_rest_api=config)
+        self._base_url = base_url
+
+    def _call(self, method: str, **kwargs) -> Any:
+        """
+        Call a REST API method and return the data.
+
+        Args:
+            method: Method name on rest_api (e.g., 'exchange_information')
+            **kwargs: Arguments to pass to the method
+
+        Returns:
+            The data from the API response
+        """
+        api = getattr(self._client.rest_api, method)
+        response = api(**kwargs)
+        return response.data()
+
     def get_account_info(self) -> Dict[str, Any]:
         """Get account information including balances and positions."""
         try:
-            return self.client.futures_account()
-        except BinanceAPIException as e:
+            # Try v3 first (more recent)
+            data = self._call('account_information_v3')
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to get account info: {e}")
-    
+
     def get_balance(self) -> List[Dict[str, Any]]:
         """Get futures account balance."""
         try:
-            return self.client.futures_account_balance()
-        except BinanceAPIException as e:
+            data = self._call('futures_account_balance_v3')
+            if isinstance(data, list):
+                return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
+            return data
+        except Exception as e:
             raise Exception(f"Failed to get balance: {e}")
-    
+
     def get_position_info(self) -> List[Dict[str, Any]]:
         """Get current positions information."""
         try:
-            return self.client.futures_position_information()
-        except BinanceAPIException as e:
+            data = self._call('account_information_v3')
+            if hasattr(data, 'positions'):
+                return [self._pydantic_to_dict(p) if hasattr(p, 'model_dump') else p for p in data.positions]
+            return []
+        except Exception as e:
             raise Exception(f"Failed to get position info: {e}")
-    
+
     def get_exchange_info(self) -> Dict[str, Any]:
         """Get exchange trading rules and symbol information."""
         try:
-            return self.client.futures_exchange_info()
-        except BinanceAPIException as e:
+            data = self._call('exchange_information')
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to get exchange info: {e}")
-    
+
     def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get information for a specific trading pair."""
         try:
             exchange_info = self.get_exchange_info()
-            for sym in exchange_info.get("symbols", []):
-                if sym.get("symbol") == symbol.upper():
+            symbols = exchange_info.get('symbols', [])
+            for sym in symbols:
+                if sym.get('symbol') == symbol.upper():
                     return sym
             return None
         except Exception as e:
             raise Exception(f"Failed to get symbol info: {e}")
-    
+
     def get_klines(
         self,
         symbol: str,
@@ -114,28 +148,29 @@ class BinanceRESTClient:
     ) -> List[List[Any]]:
         """
         Get candlestick/kline data.
-        
-        Args:
-            symbol: Trading pair (e.g., 'BTCUSDT')
-            interval: Kline interval (1m, 5m, 15m, 1h, 4h, 1d, etc.)
-            limit: Number of klines to return (max 1500)
-            start_time: Start time in milliseconds
-            end_time: End time in milliseconds
-        
-        Returns:
-            List of klines, each containing [open_time, open, high, low, close, volume, close_time, ...]
         """
         try:
-            return self.client.futures_klines(
+            data = self._call(
+                'kline_candlestick_data',
                 symbol=symbol.upper(),
                 interval=interval,
                 limit=limit,
-                startTime=start_time,
-                endTime=end_time
+                start_time=start_time,
+                end_time=end_time
             )
-        except BinanceAPIException as e:
+            # Convert to list of lists format for backward compatibility
+            if isinstance(data, list) and data:
+                first = data[0]
+                if hasattr(first, 'model_dump'):
+                    return [[
+                        item.open_time, item.open, item.high, item.low, item.close, item.volume,
+                        item.close_time, item.quote_volume, item.count, item.taker_buy_quote_volume,
+                        item.taker_buy_base_volume, item.is_final
+                    ] for item in data]
+            return data
+        except Exception as e:
             raise Exception(f"Failed to get klines: {e}")
-    
+
     def get_order_book(
         self,
         symbol: str,
@@ -143,40 +178,64 @@ class BinanceRESTClient:
     ) -> Dict[str, Any]:
         """Get order book depth for a symbol."""
         try:
-            return self.client.futures_order_book(symbol=symbol.upper(), limit=limit)
-        except BinanceAPIException as e:
+            data = self._call(
+                'order_book',
+                symbol=symbol.upper(),
+                limit=limit
+            )
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to get order book: {e}")
-    
+
     def get_recent_trades(self, symbol: str, limit: int = 500) -> List[Dict[str, Any]]:
         """Get recent trades for a symbol."""
         try:
-            return self.client.futures_recent_trades(symbol=symbol.upper(), limit=limit)
-        except BinanceAPIException as e:
+            data = self._call(
+                'recent_trades',
+                symbol=symbol.upper(),
+                limit=limit
+            )
+            if isinstance(data, list):
+                return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
+            return data
+        except Exception as e:
             raise Exception(f"Failed to get recent trades: {e}")
-    
+
     def get_mark_price(self, symbol: str) -> Dict[str, Any]:
         """Get current mark price for a symbol."""
         try:
-            return self.client.futures_mark_price(symbol=symbol.upper())
-        except BinanceAPIException as e:
+            data = self._call(
+                'mark_price',
+                symbol=symbol.upper()
+            )
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to get mark price: {e}")
-    
+
     def get_funding_rate(self, symbol: str, limit: int = 100) -> List[Dict[str, Any]]:
         """Get funding rate history for a symbol."""
         try:
-            return self.client.futures_funding_rate(symbol=symbol.upper(), limit=limit)
-        except BinanceAPIException as e:
+            data = self._call(
+                'funding_rates',
+                symbol=symbol.upper(),
+                limit=limit
+            )
+            if isinstance(data, list):
+                return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
+            return data
+        except Exception as e:
             raise Exception(f"Failed to get funding rate: {e}")
-    
+
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all open orders, optionally filtered by symbol."""
         try:
-            if symbol:
-                return self.client.futures_get_open_orders(symbol=symbol.upper())
-            return self.client.futures_get_open_orders()
-        except BinanceAPIException as e:
+            data = self._call('current_all_open_orders', symbol=symbol.upper() if symbol else None)
+            if isinstance(data, list):
+                return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
+            return data
+        except Exception as e:
             raise Exception(f"Failed to get open orders: {e}")
-    
+
     def get_all_orders(
         self,
         symbol: str,
@@ -186,15 +245,19 @@ class BinanceRESTClient:
     ) -> List[Dict[str, Any]]:
         """Get all orders for a symbol (including history)."""
         try:
-            return self.client.futures_get_all_orders(
+            data = self._call(
+                'all_orders',
                 symbol=symbol.upper(),
                 limit=limit,
-                startTime=start_time,
-                endTime=end_time
+                start_time=start_time,
+                end_time=end_time
             )
-        except BinanceAPIException as e:
+            if isinstance(data, list):
+                return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
+            return data
+        except Exception as e:
             raise Exception(f"Failed to get all orders: {e}")
-    
+
     def get_order(
         self,
         symbol: str,
@@ -203,14 +266,16 @@ class BinanceRESTClient:
     ) -> Dict[str, Any]:
         """Get details of a specific order."""
         try:
-            return self.client.futures_get_order(
+            data = self._call(
+                'query_order',
                 symbol=symbol.upper(),
-                orderId=order_id,
-                origClientOrderId=orig_client_order_id
+                order_id=order_id,
+                orig_client_order_id=orig_client_order_id
             )
-        except BinanceAPIException as e:
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to get order: {e}")
-    
+
     def create_order(
         self,
         symbol: str,
@@ -224,50 +289,38 @@ class BinanceRESTClient:
         position_side: Optional[str] = None,
         new_client_order_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """
-        Create a new futures order.
-        
-        Args:
-            symbol: Trading pair (e.g., 'BTCUSDT')
-            side: Order side ('BUY' or 'SELL')
-            order_type: Order type ('LIMIT', 'MARKET', 'STOP', 'STOP_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_MARKET', 'TRAILING_STOP_MARKET')
-            quantity: Order quantity
-            price: Order price (required for LIMIT orders)
-            stop_price: Stop price (required for STOP and TAKE_PROFIT orders)
-            time_in_force: Time in force (GTC, IOC, FOK)
-            reduce_only: If true, order only reduces position
-            position_side: Position side ('LONG', 'SHORT', or None for both)
-            new_client_order_id: Custom order ID
-        
-        Returns:
-            Order response from Binance
-        """
+        """Create a new futures order."""
         try:
             params = {
                 "symbol": symbol.upper(),
                 "side": side.upper(),
                 "type": order_type.upper(),
-                "quantity": quantity,
-                "timeInForce": time_in_force,
-                "reduceOnly": reduce_only
+                "quantity": str(quantity),
             }
-            
+
+            if order_type.upper() == "LIMIT":
+                params["time_in_force"] = time_in_force
+
             if price is not None:
-                params["price"] = price
-            
+                params["price"] = str(price)
+
             if stop_price is not None:
-                params["stopPrice"] = stop_price
-            
+                params["stop_price"] = str(stop_price)
+
+            if reduce_only:
+                params["reduce_only"] = reduce_only
+
             if position_side is not None:
-                params["positionSide"] = position_side.upper()
-            
+                params["position_side"] = position_side.upper()
+
             if new_client_order_id is not None:
-                params["newClientOrderId"] = new_client_order_id
-            
-            return self.client.futures_create_order(**params)
-        except BinanceAPIException as e:
+                params["new_client_order_id"] = new_client_order_id
+
+            data = self._call('place_order', **params)
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to create order: {e}")
-    
+
     def create_market_order(
         self,
         symbol: str,
@@ -285,7 +338,7 @@ class BinanceRESTClient:
             reduce_only=reduce_only,
             position_side=position_side
         )
-    
+
     def create_limit_order(
         self,
         symbol: str,
@@ -307,7 +360,7 @@ class BinanceRESTClient:
             reduce_only=reduce_only,
             position_side=position_side
         )
-    
+
     def create_stop_order(
         self,
         symbol: str,
@@ -330,7 +383,7 @@ class BinanceRESTClient:
             reduce_only=reduce_only,
             position_side=position_side
         )
-    
+
     def cancel_order(
         self,
         symbol: str,
@@ -339,21 +392,24 @@ class BinanceRESTClient:
     ) -> Dict[str, Any]:
         """Cancel an open order."""
         try:
-            return self.client.futures_cancel_order(
+            data = self._call(
+                'cancel_order',
                 symbol=symbol.upper(),
-                orderId=order_id,
-                origClientOrderId=orig_client_order_id
+                order_id=order_id,
+                orig_client_order_id=orig_client_order_id
             )
-        except BinanceAPIException as e:
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to cancel order: {e}")
-    
+
     def cancel_all_open_orders(self, symbol: str) -> Dict[str, Any]:
         """Cancel all open orders for a symbol."""
         try:
-            return self.client.futures_cancel_all_open_orders(symbol=symbol.upper())
-        except BinanceAPIException as e:
+            data = self._call('cancel_all_open_orders', symbol=symbol.upper())
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to cancel all orders: {e}")
-    
+
     def cancel_orders(
         self,
         symbol: str,
@@ -361,69 +417,71 @@ class BinanceRESTClient:
     ) -> Dict[str, Any]:
         """Cancel multiple orders by their IDs."""
         try:
-            return self.client.futures_cancel_orders(
+            data = self._call(
+                'cancel_multiple_orders',
                 symbol=symbol.upper(),
-                orderIdList=order_ids
+                order_id_list=order_ids
             )
-        except BinanceAPIException as e:
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to cancel orders: {e}")
-    
+
     def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
         """Set leverage for a symbol."""
         try:
-            return self.client.futures_change_leverage(
+            data = self._call(
+                'change_initial_leverage',
                 symbol=symbol.upper(),
                 leverage=leverage
             )
-        except BinanceAPIException as e:
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to set leverage: {e}")
-    
+
     def set_margin_type(
         self,
         symbol: str,
         margin_type: str,
         reduce_only: bool = False
     ) -> Dict[str, Any]:
-        """
-        Set margin type for a symbol.
-        
-        Args:
-            symbol: Trading pair
-            margin_type: 'ISOLATED' or 'CROSSED'
-            reduce_only: Whether to enable reduce only
-        """
+        """Set margin type for a symbol (ISOLATED or CROSSED)."""
         try:
-            return self.client.futures_change_margin_type(
+            data = self._call(
+                'change_margin_type',
                 symbol=symbol.upper(),
-                marginType=margin_type.upper(),
-                reduceOnly=reduce_only
+                margin_type=margin_type.upper(),
+                reduce_only=reduce_only
             )
-        except BinanceAPIException as e:
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to set margin type: {e}")
-    
+
     def get_leverage_bracket(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get leverage bracket for a symbol or all symbols."""
         try:
-            if symbol:
-                return self.client.futures_leverage_bracket(symbol=symbol.upper())
-            return self.client.futures_leverage_bracket()
-        except BinanceAPIException as e:
+            data = self._call('leverage_bracket', symbol=symbol.upper() if symbol else None)
+            if isinstance(data, list):
+                return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
+            return data
+        except Exception as e:
             raise Exception(f"Failed to get leverage bracket: {e}")
-    
+
     def get_position_mode(self) -> Dict[str, Any]:
         """Get current position mode (hedge mode or one-way)."""
         try:
-            return self.client.futures_get_position_mode()
-        except BinanceAPIException as e:
+            data = self._call('get_position_mode')
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to get position mode: {e}")
-    
+
     def set_position_mode(self, hedge_mode: bool) -> Dict[str, Any]:
         """Set position mode (hedge mode or one-way)."""
         try:
-            return self.client.futures_change_position_mode(dualCompassPosition=hedge_mode)
-        except BinanceAPIException as e:
+            data = self._call('change_position_mode', dual_position_side=hedge_mode)
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
             raise Exception(f"Failed to set position mode: {e}")
-    
+
     def get_income_history(
         self,
         symbol: Optional[str] = None,
@@ -434,28 +492,33 @@ class BinanceRESTClient:
     ) -> List[Dict[str, Any]]:
         """Get income history (trading fee, realized PNL, funding fee, etc.)."""
         try:
-            return self.client.futures_income_history(
+            data = self._call(
+                'get_income_history',
                 symbol=symbol.upper() if symbol else None,
-                incomeType=income_type,
+                income_type=income_type,
                 limit=limit,
-                startTime=start_time,
-                endTime=end_time
+                start_time=start_time,
+                end_time=end_time
             )
-        except BinanceAPIException as e:
+            if isinstance(data, list):
+                return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
+            return data
+        except Exception as e:
             raise Exception(f"Failed to get income history: {e}")
-    
+
     def get_notional_and_leverage(
         self,
         symbol: Optional[str] = None
     ) -> List[Dict[str, Any]]:
         """Get notional and leverage bracketed info."""
         try:
-            if symbol:
-                return self.client.futures_notional_and_leverage(symbol=symbol.upper())
-            return self.client.futures_notional_and_leverage()
-        except BinanceAPIException as e:
+            data = self._call('notional_and_leverage_bracket', symbol=symbol.upper() if symbol else None)
+            if isinstance(data, list):
+                return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
+            return data
+        except Exception as e:
             raise Exception(f"Failed to get notional and leverage: {e}")
-    
+
     def get_account_trades(
         self,
         symbol: str,
@@ -465,39 +528,47 @@ class BinanceRESTClient:
     ) -> List[Dict[str, Any]]:
         """Get account trade history for a symbol."""
         try:
-            return self.client.futures_account_trades(
+            data = self._call(
+                'account_trade_list',
                 symbol=symbol.upper(),
                 limit=limit,
-                startTime=start_time,
-                endTime=end_time
+                start_time=start_time,
+                end_time=end_time
             )
-        except BinanceAPIException as e:
+            if isinstance(data, list):
+                return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
+            return data
+        except Exception as e:
             raise Exception(f"Failed to get account trades: {e}")
-    
+
     def get_server_time(self) -> Dict[str, Any]:
         """Get server time."""
         try:
-            return self.client.get_server_time()
+            data = self._call('check_server_time')
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
             raise Exception(f"Failed to get server time: {e}")
-    
+
     def ping(self) -> Dict[str, Any]:
         """Ping the Binance API to check connectivity."""
         try:
-            return self.client.ping()
+            data = self._call('check_server_time')
+            return {"status": "ok"}
         except Exception as e:
             raise Exception(f"Failed to ping: {e}")
 
+    @staticmethod
+    def _pydantic_to_dict(obj: Any) -> Dict[str, Any]:
+        """Convert a Pydantic model to dict."""
+        if hasattr(obj, 'model_dump'):
+            return obj.model_dump()
+        elif hasattr(obj, 'dict'):
+            return obj.dict()
+        elif hasattr(obj, '__dict__'):
+            return obj.__dict__
+        return obj
 
-# Convenience function for quick client creation
-def create_binance_client(
-    api_key: Optional[str] = None,
-    api_secret: Optional[str] = None,
-    testnet: bool = True
-) -> BinanceRESTClient:
-    """Create and return a Binance REST client."""
-    return BinanceRESTClient(
-        api_key=api_key,
-        api_secret=api_secret,
-        testnet=testnet
-    )
+
+def create_binance_client(testnet: bool = True) -> BinanceRESTClient:
+    """Convenience function to create a Binance REST client."""
+    return BinanceRESTClient(testnet=testnet)

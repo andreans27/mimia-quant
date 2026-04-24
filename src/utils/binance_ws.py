@@ -20,8 +20,10 @@ class BinanceWebSocketClient:
     Supports multiple streams: klines, ticker, trades, book depth, and user data.
     """
     
-    STREAM_URL = "wss://stream.binancefuture.com/ws"
-    TESTNET_STREAM_URL = "wss://stream.binancefuture.com/ws"
+    # Per Binance docs: https://developers.binance.com/docs/derivatives/usds-margined-futures/general-info
+    # WebSocket Streams: fstream (fstream.binance.com = production, fstream.binancefuture.com = testnet)
+    STREAM_URL = "wss://fstream.binance.com"
+    DEMO_STREAM_URL = "wss://fstream.binancefuture.com"
     
     def __init__(
         self,
@@ -51,7 +53,7 @@ class BinanceWebSocketClient:
         self.api_key = api_key
         self.api_secret = api_secret
         
-        self.stream_url = self.TESTNET_STREAM_URL if testnet else self.STREAM_URL
+        self.stream_url = self.DEMO_STREAM_URL if testnet else self.STREAM_URL
         
         self._ws: Optional[WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
@@ -482,8 +484,9 @@ class BinanceUserDataWebSocket:
     Provides real-time updates for account balance, positions, and orders.
     """
     
-    USER_DATA_STREAM_URL = "wss://stream.binancefuture.com/ws"
-    TESTNET_USER_DATA_STREAM_URL = "wss://stream.binancefuture.com/ws"
+    # Per Binance docs: same fstream endpoints for user data
+    USER_DATA_STREAM_URL = "wss://fstream.binance.com"
+    DEMO_USER_DATA_STREAM_URL = "wss://fstream.binancefuture.com"
     
     def __init__(
         self,
@@ -507,7 +510,7 @@ class BinanceUserDataWebSocket:
         """
         self.listen_key = listen_key
         self.testnet = testnet
-        self.stream_url = self.TESTNET_USER_DATA_STREAM_URL if testnet else self.USER_DATA_STREAM_URL
+        self.stream_url = self.DEMO_USER_DATA_STREAM_URL if testnet else self.USER_DATA_STREAM_URL
         
         self._ws: Optional[WebSocketApp] = None
         self._thread: Optional[threading.Thread] = None
