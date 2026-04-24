@@ -142,7 +142,8 @@ class BinanceWebSocketClient:
         
         return handle_open
     
-    def _stream_handlers: Dict[str, Callable]:
+    @property
+    def _stream_handlers(self) -> Dict[str, Callable]:
         """Dictionary of stream event handlers."""
         return getattr(self, '_stream_handlers_dict', {})
     

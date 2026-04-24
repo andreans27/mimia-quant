@@ -7,13 +7,24 @@ import os
 from typing import Optional, Dict, Any, List
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-from binance.enums import (
-    OrderSide,
-    OrderType,
-    PositionSide,
-    TimeInForce,
-    FutureOrderType
-)
+
+# Enum equivalents (since binance 1.0.36 doesn't have enums module)
+ORDER_SIDE_BUY = "BUY"
+ORDER_SIDE_SELL = "SELL"
+ORDER_TYPE_LIMIT = "LIMIT"
+ORDER_TYPE_MARKET = "MARKET"
+ORDER_TYPE_STOP = "STOP"
+ORDER_TYPE_STOP_MARKET = "STOP_MARKET"
+ORDER_TYPE_TAKE_PROFIT = "TAKE_PROFIT"
+ORDER_TYPE_TAKE_PROFIT_MARKET = "TAKE_PROFIT_MARKET"
+POSITION_SIDE_LONG = "LONG"
+POSITION_SIDE_SHORT = "SHORT"
+TIME_IN_FORCE_GTC = "GTC"
+TIME_IN_FORCE_IOC = "IOC"
+TIME_IN_FORCE_FOK = "FOK"
+ORDER_RESP_TYPE_ACK = "ACK"
+ORDER_RESP_TYPE_RESULT = "RESULT"
+ORDER_RESP_TYPE_FULL = "FULL"
 
 
 class BinanceRESTClient:
@@ -208,7 +219,7 @@ class BinanceRESTClient:
         quantity: float,
         price: Optional[float] = None,
         stop_price: Optional[float] = None,
-        time_in_force: str = TimeInForce.GTC,
+        time_in_force: str = TIME_IN_FORCE_GTC,
         reduce_only: bool = False,
         position_side: Optional[str] = None,
         new_client_order_id: Optional[str] = None
@@ -281,7 +292,7 @@ class BinanceRESTClient:
         side: str,
         quantity: float,
         price: float,
-        time_in_force: str = TimeInForce.GTC,
+        time_in_force: str = TIME_IN_FORCE_GTC,
         reduce_only: bool = False,
         position_side: Optional[str] = None
     ) -> Dict[str, Any]:
