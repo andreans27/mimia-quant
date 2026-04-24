@@ -1,0 +1,36 @@
+.PHONY: install test lint typecheck backtest run report cron-setup clean
+
+install:
+	python3 -m ensurepip --upgrade
+	python3 -m pip install -r requirements.txt
+
+test:
+	pytest tests/ -v --cov=src --cov-report=term-missing
+
+lint:
+	flake8 src/ --max-line-length=100 --extend-ignore=E203,W503
+	black --check src/
+
+typecheck:
+	mypy src/ --ignore-missing-imports
+
+backtest:
+	python3 scripts/run_backtest.py
+
+run:
+	python3 scripts/run_bot.py
+
+report:
+	python3 scripts/run_monitoring.py
+
+cron-setup:
+	python3 scripts/setup_cron.py
+
+init-db:
+	python3 scripts/init_db.py
+
+clean:
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
+	find . -type f -name "*.pyc" -delete 2>/dev/null || true
+	rm -rf data/*.db data/*.db-journal logs/*.log

@@ -1,0 +1,32 @@
+name: Notify Deployment
+description: Send deployment notification
+inputs:
+  status:
+    description: 'Deployment status'
+    required: true
+  environment:
+    description: 'Environment name'
+    required: true
+  deployment_id:
+    description: 'Deployment ID'
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: Send notification
+      shell: bash
+      run: |
+        STATUS="${{ inputs.status }}"
+        ENV="${{ inputs.environment }}"
+        DEPLOY_ID="${{ inputs.deployment_id }}"
+        
+        if [ "$STATUS" == "success" ]; then
+          echo "✅ Deployment to $ENV completed successfully"
+          echo "   Deployment ID: $DEPLOY_ID"
+        else
+          echo "❌ Deployment to $ENV failed"
+          echo "   Deployment ID: $DEPLOY_ID"
+          echo "   Status: $STATUS"
+        fi
+        
+        # In production, would send Slack/Teams notification here

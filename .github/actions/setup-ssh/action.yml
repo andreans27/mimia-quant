@@ -1,0 +1,23 @@
+name: Setup SSH
+description: Configure SSH for deployment
+inputs:
+  host:
+    description: 'SSH host'
+    required: true
+  username:
+    description: 'SSH username'
+    required: true
+  key:
+    description: 'SSH private key'
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: Configure SSH
+      shell: bash
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ inputs.key }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+        ssh-keyscan -H ${{ inputs.host }} >> ~/.ssh/known_hosts 2>/dev/null
+        echo "SSH configured for ${{ inputs.username }}@${{ inputs.host }}"

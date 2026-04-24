@@ -1,0 +1,78 @@
+# Strategy Configurations for Mimia Quant Trading System
+
+strategies:
+  # Momentum-based strategy
+  momentum:
+    enabled: true
+    lookback_period: 20
+    signal_period: 10
+    threshold: 0.02
+    exit_on_cross: true
+    position_sizing:
+      method: "equal_weight"
+      base_size: 0.05
+    filters:
+      min_volume: 1000000
+      min_volatility: 0.01
+      max_volatility: 0.5
+
+  # Mean reversion strategy
+  mean_reversion:
+    enabled: false
+    lookback_period: 50
+    std_dev_threshold: 2.0
+    exit_threshold: 0.5
+    holding_period_max: 100
+    position_sizing:
+      method: "kelly"
+      kelly_fraction: 0.25
+    filters:
+      min_volume: 500000
+      atr_period: 14
+      max_atr_multiplier: 5.0
+
+  # Grid trading strategy
+  grid:
+    enabled: false
+    grid_levels: 10
+    grid_spacing_pct: 0.01
+    order_quantity_pct: 0.01
+    rebalance_threshold: 0.1
+    auto_compound: true
+    position_sizing:
+      method: "fixed"
+      fixed_size: 0.02
+
+  # Breakout strategy
+  breakout:
+    enabled: false
+    lookback_period_high: 50
+    lookback_period_low: 20
+    confirmation_bars: 2
+    atr_multiplier: 2.0
+    trailing_stop: true
+    position_sizing:
+      method: "dynamic"
+      risk_per_trade: 0.02
+    filters:
+      min_volume_ratio: 2.0
+      min_range_expansion: 1.5
+
+  # Arbitrage strategy (future)
+  arbitrage:
+    enabled: false
+    exchanges: ["binance", "alpaca"]
+    min_spread_pct: 0.1
+    max_position_size: 0.05
+    latency_threshold_ms: 100
+    position_sizing:
+      method: "fixed"
+      fixed_size: 0.01
+
+# Global strategy settings
+global:
+  max_concurrent_strategies: 3
+  strategy_allocation_method: "equal"  # equal, weighted, risk_parity
+  correlation_threshold: 0.7
+  rebalance_frequency: "daily"  # hourly, daily, weekly
+  cooldown_period_seconds: 300

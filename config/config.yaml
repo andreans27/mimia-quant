@@ -1,0 +1,64 @@
+# Mimia Quant Trading System Configuration
+
+system:
+  name: "mimia-quant"
+  version: "1.0.0"
+  environment: "development"  # development, staging, production
+  debug: true
+  log_level: "INFO"
+
+# Database configuration
+database:
+  host: "localhost"
+  port: 6379
+  db: 0
+  password: null
+  ssl: false
+
+# Redis configuration (for caching and pub/sub)
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  password: null
+  max_connections: 50
+
+# Exchange API settings
+exchange:
+  default_exchange: "binance"
+  sandbox_mode: true
+  rate_limit:
+    requests_per_second: 10
+    burst: 20
+  retry:
+    max_attempts: 3
+    backoff_factor: 2
+
+# Trading settings
+trading:
+  max_position_size: 0.1  # 10% of portfolio per position
+  max_total_exposure: 0.8  # 80% max portfolio exposure
+  default_stop_loss_pct: 2.0
+  default_take_profit_pct: 5.0
+  max_leverage: 3
+
+# Risk management
+risk:
+  max_daily_loss: 0.05  # 5% max daily loss
+  max_drawdown: 0.15  # 15% max drawdown
+  position_sizing_method: "kelly"  # kelly, fixed, dynamic
+  min_risk_reward_ratio: 2.0
+
+# Monitoring
+monitoring:
+  prometheus_port: 9090
+  metrics_enabled: true
+  health_check_port: 8080
+  performance_tracking: true
+
+# Execution
+execution:
+  order_type: "market"  # market, limit
+  timeout_seconds: 30
+  slippage_tolerance: 0.001
+  partial_fill_enabled: true

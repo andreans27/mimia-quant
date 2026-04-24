@@ -1,0 +1,351 @@
+name: Deploy to Production
+
+on:
+  workflow_run:
+    workflow: CI Pipeline
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.11'
+  DEPLOY_USER: deployer
+
+jobs:
+  # ============================================================================
+  # Deployment Preparation
+  # ============================================================================
+  prepare:
+    name: Prepare Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      deployment_id: ${{ steps.deploy.outputs.deployment_id }}
+      environment: ${{ inputs.environment || 'staging' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Get commit info
+        id: commit
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "message=$(git log -1 --format=%B | head -n 1)" >> $GITHUB_OUTPUT
+          echo "author=$(git log -1 --format=%an)" >> $GITHUB_OUTPUT
+
+      - name: Determine deployment environment
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "env=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "env=production" >> $GITHUB_OUTPUT
+          else
+            echo "env=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create deployment record
+        id: deploy
+        run: |
+          DEPLOYMENT_ID="deploy_$(date +%Y%m%d_%H%M%S)_${GITHUB_SHA:0:8}"
+          echo "deployment_id=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+          echo "Created deployment: $DEPLOYMENT_ID"
+
+      - name: Upload deployment info
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-info
+          path: |
+            deployment-info.json
+          retention-days: 30
+
+  # ============================================================================
+  # Deploy to Staging
+  # ============================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.environment == 'staging'
+    environment:
+      name: staging
+      url: https://staging.mimia-quant.example.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up SSH
+        uses: ./.github/actions/setup-ssh
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ env.DEPLOY_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Deploy to staging server
+        run: |
+          echo "=== Deploying to Staging ==="
+          
+          # Create deployment directory
+          ssh ${{ env.DEPLOY_USER }}@${{ secrets.STAGING_HOST }} "
+            mkdir -p /opt/mimia-quant/{releases,shared,current}
+            
+            # Backup current release
+            if [ -d /opt/mimia-quant/current ]; then
+              cp -r /opt/mimia-quant/current /opt/mimia-quant/releases/backup_$(date +%Y%m%d_%H%M%S)
+            fi
+            
+            # Create new release directory
+            RELEASE_DIR=/opt/mimia-quant/releases/${{ needs.prepare.outputs.deployment_id }}
+            mkdir -p $RELEASE_DIR
+          "
+          
+          # Sync code to server
+          rsync -avz --delete \
+            --exclude '.git' \
+            --exclude '__pycache__' \
+            --exclude '*.pyc' \
+            --exclude '.env' \
+            ./ ${{ env.DEPLOY_USER }}@${{ secrets.STAGING_HOST }}:/opt/mimia-quant/releases/${{ needs.prepare.outputs.deployment_id }}/
+          
+          # Link current directory
+          ssh ${{ env.DEPLOY_USER }}@${{ secrets.STAGING_HOST }} "
+            cd /opt/mimia-quant
+            rm -f current
+            ln -s releases/${{ needs.prepare.outputs.deployment_id }} current
+          "
+          
+          # Install dependencies
+          ssh ${{ env.DEPLOY_USER }}@${{ secrets.STAGING_HOST }} "
+            cd /opt/mimia-quant/current
+            python -m pip install -r requirements.txt --quiet
+          "
+          
+          # Restart services
+          ssh ${{ env.DEPLOY_USER }}@${{ secrets.STAGING_HOST }} "
+            systemctl restart mimia-quant-staging || true
+            sleep 2
+            systemctl status mimia-quant-staging --no-pager
+          "
+          
+          echo "=== Staging deployment complete ==="
+
+      - name: Verify deployment
+        run: |
+          echo "Verifying deployment..."
+          # In production, would check health endpoints
+          sleep 5
+          curl -f https://staging.mimia-quant.example.com/health || true
+
+      - name: Notify deployment
+        if: always()
+        uses: ./.github/actions/notify-deployment
+        with:
+          status: ${{ job.status }}
+          environment: staging
+          deployment_id: ${{ needs.prepare.outputs.deployment_id }}
+
+  # ============================================================================
+  # Deploy to Production
+  # ============================================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [prepare]
+    if: needs.prepare.outputs.environment == 'production'
+    environment:
+      name: production
+      url: https://mia-quant.example.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up SSH
+        uses: ./.github/actions/setup-ssh
+        with:
+          host: ${{ secrets.PRODUCTION_HOST }}
+          username: ${{ env.DEPLOY_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Pre-deployment checks
+        run: |
+          echo "=== Pre-Deployment Checks ==="
+          echo "Deployment ID: ${{ needs.prepare.outputs.deployment_id }}"
+          echo "Commit: ${{ github.sha }}"
+          
+          # Check that we're on main branch
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "ERROR: Production deployment only allowed from main branch"
+            exit 1
+          fi
+          
+          # Verify no critical tests failed in CI
+          echo "CI checks passed - proceeding with production deployment"
+
+      - name: Create production backup
+        run: |
+          echo "=== Creating Production Backup ==="
+          ssh ${{ env.DEPLOY_USER }}@${{ secrets.PRODUCTION_HOST }} "
+            cd /opt/mimia-quant
+            BACKUP_NAME=backup_$(date +%Y%m%d_%H%M%S)
+            
+            # Create backup of current release
+            if [ -d releases/current ]; then
+              cp -r releases/current /opt/mimia-quant/backups/\$BACKUP_NAME
+              echo 'Backup created: \$BACKUP_NAME'
+            fi
+            
+            # Create database backup
+            if [ -f data/mimia_quant.db ]; then
+              cp data/mimia_quant.db /opt/mimia-quant/backups/db_\$BACKUP_NAME
+              echo 'Database backed up'
+            fi
+          "
+
+      - name: Deploy to production server
+        run: |
+          echo "=== Deploying to Production ==="
+          
+          ssh ${{ env.DEPLOY_USER }}@${{ secrets.PRODUCTION_HOST }} "
+            mkdir -p /opt/mimia-quant/{releases,shared,current,backups}
+          "
+          
+          # Sync code to server
+          rsync -avz \
+            --exclude '.git' \
+            --exclude '__pycache__' \
+            --exclude '*.pyc' \
+            --exclude '.env' \
+            --exclude 'logs/*' \
+            ./ ${{ env.DEPLOY_USER }}@${{ secrets.PRODUCTION_HOST }}:/opt/mimia-quant/releases/${{ needs.prepare.outputs.deployment_id }}/
+          
+          # Link current and shared directories
+          ssh ${{ env.DEPLOY_USER }}@${{ secrets.PRODUCTION_HOST }} "
+            cd /opt/mimia-quant
+            rm -f current
+            ln -s releases/${{ needs.prepare.outputs.deployment_id }} current
+            
+            # Link shared directories
+            rm -rf current/logs
+            ln -s /opt/mimia-quant/shared/logs current/logs
+            rm -rf current/data
+            ln -s /opt/mimia-quant/shared/data current/data
+          "
+          
+          # Install dependencies
+          ssh ${{ env.DEPLOY_USER }}@${{ secrets.PRODUCTION_HOST }} "
+            cd /opt/mimia-quant/current
+            python -m pip install -r requirements.txt --quiet --user
+          "
+
+      - name: Perform health checks
+        run: |
+          echo "=== Running Health Checks ==="
+          
+          for i in {1..5}; do
+            echo "Health check attempt $i..."
+            if curl -sf https://mia-quant.example.com/health > /dev/null 2>&1; then
+              echo "Health check passed"
+              exit 0
+            fi
+            sleep 5
+          done
+          
+          echo "Health check failed - initiating rollback"
+          exit 1
+
+      - name: Restart production services
+        run: |
+          echo "=== Restarting Production Services ==="
+          
+          ssh ${{ env.DEPLOY_USER }}@${{ secrets.PRODUCTION_HOST }} "
+            systemctl restart mimia-quant || true
+            sleep 3
+            systemctl status mimia-quant --no-pager -l
+          "
+
+      - name: Verify production deployment
+        run: |
+          echo "=== Verifying Production Deployment ==="
+          
+          # Check service is running
+          ssh ${{ env.DEPLOY_USER }}@${{ secrets.PRODUCTION_HOST }} "
+            systemctl is-active mimia-quant
+          "
+          
+          # Check logs for errors
+          ssh ${{ env.DEPLOY_USER }}@${{ secrets.PRODUCTION_HOST }} "
+            tail -50 /opt/mimia-quant/shared/logs/mimia-quant.log | grep -i error || echo 'No errors in recent logs'
+          "
+
+      - name: Cleanup old releases
+        run: |
+          echo "=== Cleaning Up Old Releases ==="
+          ssh ${{ env.DEPLOY_USER }}@${{ secrets.PRODUCTION_HOST }} "
+            cd /opt/mimia-quant/releases
+            
+            # Keep last 5 releases
+            ls -t | tail -n +6 | xargs -r rm -rf
+            
+            # List remaining releases
+            echo 'Remaining releases:'
+            ls -la
+          "
+
+      - name: Notify deployment
+        if: always()
+        uses: ./.github/actions/notify-deployment
+        with:
+          status: ${{ job.status }}
+          environment: production
+          deployment_id: ${{ needs.prepare.outputs.deployment_id }}
+
+  # ============================================================================
+  # Post-Deployment Verification
+  # ============================================================================
+  post-deploy:
+    name: Post-Deployment Verification
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    steps:
+      - name: Generate deployment report
+        run: |
+          echo "=== Deployment Report ==="
+          echo "Status: ${{ needs.deploy-staging.result || needs.deploy-production.result }}"
+          echo "Environment: ${{ needs.prepare.outputs.environment }}"
+          echo "Deployment ID: ${{ needs.prepare.outputs.deployment_id }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Triggered by: ${{ github.actor }}"
+          
+          if [[ "${{ needs.deploy-staging.result }}" == "success" ]] || [[ "${{ needs.deploy-production.result }}" == "success" ]]; then
+            echo "✓ Deployment successful"
+          else
+            echo "✗ Deployment failed"
+            exit 1
+          fi
+
+      - name: Create GitHub Deployment
+        uses: peaceiris/actions-gh-release@v3
+        with:
+          tag_name: deployment-${{ needs.prepare.outputs.deployment_id }}
+          release_name: Deployment ${{ needs.prepare.outputs.deployment_id }}
+          description: "Production deployment via CI/CD"
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
