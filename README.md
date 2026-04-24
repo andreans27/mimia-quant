@@ -1,175 +1,92 @@
 # Mimia Quant Trading System
 
-A modular, event-driven quantitative trading system with support for multiple exchanges, strategies, and risk management.
+Systematic crypto quant trading system for Binance Futures — built for mid-frequency execution on both long and short sides.
 
-## Features
-
-- **Multi-Exchange Support**: Binance, Alpaca, Coinbase, and more
-- **Strategy Framework**: Easy-to-extend strategy base classes
-- **Risk Management**: Built-in position sizing, stop-loss, and drawdown controls
-- **Real-time Monitoring**: Prometheus metrics and Grafana dashboards
-- **Async Execution**: Fully asynchronous order execution
-- **Configurable**: YAML-based configuration with environment variable overrides
-
-## Project Structure
+## Architecture
 
 ```
-mimia-quant/
-├── config/              # Main configuration files
-│   ├── config.yaml     # System configuration
-│   └── ...
-├── configs/            # Additional configurations
-│   └── strategies.yaml # Strategy-specific settings
-├── src/                # Source code
-│   ├── core/          # Core components (base classes, config, logging)
-│   ├── strategies/    # Trading strategies
-│   ├── execution/     # Order execution handlers
-│   ├── monitoring/    # Monitoring and metrics
-│   └── utils/         # Utility functions
-├── data/              # Data storage
-├── docs/              # Documentation
-├── scripts/           # Utility scripts
-├── tests/             # Test suite
-└── logs/              # Log files
+├── src/
+│   ├── core/          # Config, database, Redis, logging
+│   ├── strategies/    # 5 trading strategies + backtesting
+│   ├── execution/     # Order execution, position sizing, risk
+│   ├── monitoring/    # Daily reports, Telegram, edge decay
+│   └── utils/         # Binance REST + WebSocket clients
+├── configs/           # Strategy & risk parameter configs
+├── scripts/           # init_db, run_bot, test_api
+├── data/              # SQLite DB + market data storage
+├── tests/             # 69 passing tests
+└── .github/workflows/ # CI/CD with GitHub Actions
 ```
 
-## Installation
-
-1. Clone the repository:
-```bash
-git clone https://github.com/your-repo/mimia-quant.git
-cd mimia-quant
-```
-
-2. Create a virtual environment:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
-
-4. Configure environment:
-```bash
-cp .env.example .env
-# Edit .env with your API keys and settings
-```
-
-## Configuration
-
-Configuration is loaded from multiple sources with the following precedence:
-1. Environment variables (highest priority)
-2. YAML configuration files
-3. Default values (lowest priority)
-
-### Main Configuration (`config/config.yaml`)
-
-```yaml
-system:
-  name: "mimia-quant"
-  version: "1.0.0"
-  environment: "development"
-
-trading:
-  max_position_size: 0.1  # 10% of portfolio
-  max_daily_loss: 0.05    # 5% max daily loss
-
-risk:
-  max_drawdown: 0.15      # 15% max drawdown
-  max_leverage: 3
-```
-
-### Strategy Configuration (`configs/strategies.yaml`)
-
-Configure individual strategy parameters including indicators, position sizing, and filters.
-
-## Usage
-
-### Basic Example
-
-```python
-from src.core import (
-    Config,
-    setup_logging,
-    get_logger,
-    BaseStrategy,
-)
-
-# Initialize configuration and logging
-config = Config()
-config.load()
-logger = setup_logging(log_level=config.log_level)
-
-# Create a custom strategy
-class MyStrategy(BaseStrategy):
-    def analyze(self, symbol, data):
-        # Implement strategy logic
-        return signal
-    
-    def calculate_position_size(self, signal, portfolio_value):
-        return 0.05  # 5% of portfolio
-
-# Run strategy
-strategy = MyStrategy("my_strategy", config.get_strategy("momentum"))
-```
-
-### Running in Production
+## Quick Start
 
 ```bash
-# Set environment
-export ENVIRONMENT=production
-export LOG_LEVEL=INFO
+# Install dependencies
+make install
 
-# Run the trading system
-python -m src.main
+# Initialize database
+python scripts/init_db.py
+
+# Run tests
+make test
+
+# Start trading bot
+make run
 ```
 
-## Available Strategies
+## Strategies
 
-- **Momentum**: Trend-following strategy using moving averages
-- **Mean Reversion**: Returns to average price strategy
-- **Grid**: Grid trading with automatic order placement
-- **Breakout**: Support/resistance breakout strategy
+| Strategy | Timeframe | Edge |
+|----------|-----------|------|
+| **Momentum** | 1m | Trend continuation after micro-breakouts |
+| **Mean Reversion** | 1m | RSI/BB-based reversal at extremes |
+| **Grid** | 5m | Range-bound price action exploitation |
+| **Breakout** | 15m | Liquidity grab + volatility expansion |
+| **Multi-Timeframe** | 1h+4h | Macro trend + micro entry alignment |
 
-## Risk Management
+## Trading Parameters
 
-The system includes built-in risk management features:
+- **Initial Capital**: 5,000 USDT (testnet)
+- **Leverage**: 3x default, max 5x
+- **Max Position**: 1.5% risk per trade
+- **Max Daily DD**: 3% → reduce sizing 50%
+- **Max Monthly DD**: 8% → full system halt
 
-- Position size limits
-- Daily loss limits
-- Maximum drawdown protection
-- Correlation-based position filtering
-- Kelly criterion for position sizing
+## CI/CD Pipeline
 
-## Monitoring
+- **GitHub Actions** on every push: lint, typecheck, tests
+- **Branch protection**: `main` requires PR + passing CI
+- **Auto-deploy**: not enabled (manual trigger for safety)
 
-- **Prometheus Metrics**: Port 9090
-- **Health Check**: Port 8080
-- **Grafana Dashboard**: Configurable
+## Telegram Reporting (08:00 UTC daily)
 
-## Development
+- Open positions & unrealized P&L
+- Daily P&L & equity curve
+- Strategy vote distribution
+- Edge decay alerts
+- Kill switch triggers
 
-### Running Tests
+## Credentials
 
-```bash
-pytest tests/
+Configure in `.env` (copy from `.env.example`):
+
+```env
+BINANCE_TESTNET_API_KEY=your_key
+BINANCE_TESTNET_API_SECRET=your_secret
+TELEGRAM_BOT_TOKEN=your_token
+TELEGRAM_CHAT_ID=your_chat_id
 ```
 
-### Code Quality
+## Current Status
 
-```bash
-black src/
-flake8 src/
-mypy src/
-```
+🟡 **Testnet Mode** — Paper trading with live market data
+- 69 tests passing
+- All 5 strategies implemented
+- Database initialized
+- Telegram reporting configured
+- API market data verified ✓
+- API auth endpoints — requires valid testnet key
 
-## License
+---
 
-MIT License - see LICENSE file for details
-
-## Support
-
-For issues and feature requests, please use the GitHub issue tracker.
+*Build: 2025-04-24 | Version: 2.0*
