@@ -21,7 +21,7 @@
 | **Strategy** | Multi-TF XGBoost Ensemble (5m, 15m, 30m, 1h, 4h) |
 | **Signal Threshold** | 0.60 (optimal via grid scan across 12 symbols) |
 | **Avg Win Rate (retrained pairs)** | 76.9–88.4% across symbols |
-| **Scan Interval** | Every 60 minutes |
+| **Scan Interval** | Every 5 minutes (daemon) |
 | **Open Positions** | 0 (fresh start after architecture update) |
 
 ### Active Pairs
@@ -56,7 +56,7 @@
 ### Production‑Grade Tooling
 - **Binance Testnet Integration** — real order execution on paper environment with accurate fee & slippage modeling
 - **Telegram Reporting** — automated reports every 5-minute daemon cycle via Telegram bot
-- **Cron‑Based Scheduling** — autonomous signal scan every 60 minutes with hourly retraining monitor
+- **Daemon-Based Execution** — autonomous signal scan every 5 minutes via persistent trading daemon (see `scripts/trading/`)
 - **SQLite Persistence** — trade log, capital history, signal records
 - **CI/CD Pipeline** — GitHub Actions with linting, testing, security scan, and pre‑deploy validation
 
@@ -66,19 +66,23 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                        Cron Scheduler                             │
-│          ┌──────────────────────┐  ┌────────────────────────────┐ │
-│          │ Signal Scan (hourly) │  │ Retrain Monitor (hourly)   │ │
-│          │ → python main.py     │  │ → auto_retrain.py          │ │
-│          └──────────┬───────────┘  └──────────┬─────────────────┘ │
-├─────────────────────┼─────────────────────────┼───────────────────┤
-│                     ▼                         ▼                    │
-│              Live Trading Engine                                │
-│  ┌──────────┐  ┌──────────┐  ┌────────┐  ┌──────────────────┐  │
-│  │ Signal    │  │ Position │  │ Kelly  │  │ Regime /         │  │
-│  │ Pipeline  │→│ Manager  │→│ Sizer  │→│ Exit Strategy    │  │
-│  │ (ML Ens.) │  │          │  │        │  │ (ATR/SMA/Hold)   │  │
-│  └──────────┘  └──────────┘  └────────┘  └──────────────────┘  │
+│                     Daemon Loop (5min cycle)                       │
+│          ┌──────────────────────────┐                             │
+│          │ Signal Scan (every 5min)  │                             │
+│          │ → engine.py runs cycle    │                             │
+│          └──────────┬───────────────┘                             │
+│          ┌──────────────────────────┐                             │
+│          │ Cron Monitoring (hourly)  │  ← akan jadi daily         │
+│          │ → auto_retrain.py        │                             │
+│          └──────────────────────────┘                             │
+├───────────────────┼───────────────────────────────────────────────┤
+│                   ▼                                                │
+│              Live Trading Engine                                  │
+│  ┌──────────┐  ┌──────────┐  ┌────────┐  ┌──────────────────┐   │
+│  │ Signal    │  │ Position │  │ Kelly  │  │ Regime /         │   │
+│  │ Pipeline  │→│ Manager  │→│ Sizer  │→│ Exit Strategy    │   │
+│  │ (ML Ens.) │  │          │  │        │  │ (ATR/SMA/Hold)   │   │
+│  └──────────┘  └──────────┘  └────────┘  └──────────────────┘   │
 ├──────────────────────────────────────────────────────────────────┤
 │                        Data Layer                                 │
 │  ┌────────────┐  ┌──────────────┐  ┌──────────────────────────┐ │
@@ -203,11 +207,14 @@ make test
 python main.py
 ```
 
-Or deploy as a cron job (runs automatically every 60 min):
+Or deploy the persistent daemon:
 ```bash
-# Via Hermes cron scheduler
-# cron_hourly.py orchestrates signal scan + retrain monitor
+bash scripts/trading/live_trader_daemon.sh --testnet
+# Runs autonomously every 5 minutes
 ```
+
+A separate cron job (`scripts/operations/cron_hourly.py`) monitors model performance
+and triggers retraining — will transition to daily once stable.
 
 ---
 
