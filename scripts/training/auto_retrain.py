@@ -328,7 +328,7 @@ def compare_with_production(symbol: str, new_metrics: dict,
     return decision
 
 
-def save_status(symbol: str, metrics: dict):
+def save_status(symbol: str, metrics: dict, deployed: bool = False):
     """Save latest metrics to retrain status file."""
     status_file = STATUS_FILE
     if status_file.exists():
@@ -339,6 +339,9 @@ def save_status(symbol: str, metrics: dict):
     
     data['symbols'][symbol] = metrics
     data['symbols'][symbol]['last_retrained'] = datetime.now().isoformat()
+    data['symbols'][symbol]['deployed'] = deployed
+    if deployed:
+        data['symbols'][symbol]['deployed_at'] = datetime.now().isoformat()
     data['last_run'] = datetime.now().isoformat()
     
     with open(status_file, 'w') as f:
@@ -443,7 +446,7 @@ def retrain_symbol(symbol: str, force: bool = False) -> dict:
     if decision['should_deploy']:
         status(f"✅ Deploying new models — {decision['reason']}", symbol)
         # Keep backup, update status
-        save_status(symbol, val_metrics)
+        save_status(symbol, val_metrics, deployed=True)
     else:
         status(f"↩️ Skipping deploy — {decision['reason']}", symbol)
         # Remove newly trained models, then restore old ones from backup
@@ -455,10 +458,9 @@ def retrain_symbol(symbol: str, force: bool = False) -> dict:
         # Restore all backed-up models (both old and new naming)
         for f in backup_dir.iterdir():
             shutil.copy2(str(f), str(MODEL_DIR / f.name))
-        # But save status anyway for reference
-        val_metrics['deployed'] = False
+        # Save status for reference
         val_metrics['reason'] = decision['reason']
-        save_status(symbol, val_metrics)
+        save_status(symbol, val_metrics, deployed=False)
     
     elapsed = time.time() - t_start
     status(f"Done in {elapsed:.0f}s", symbol)
