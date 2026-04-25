@@ -6,6 +6,8 @@ pyyaml>=6.0
 
 # Trading/APIs
 python-binance>=1.0.19
+binance-sdk-derivatives-trading-usds-futures>=10.0.1
+binance-common>=3.8.0
 ccxt>=4.0.0
 requests>=2.31.0
 aiohttp>=3.9.0

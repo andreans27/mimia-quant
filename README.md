@@ -5,8 +5,9 @@
 [![Tests](https://img.shields.io/badge/tests-69%20passing-brightgreen)](https://github.com/andreans27/mimia-quant/actions)
 [![XGBoost](https://img.shields.io/badge/XGBoost-3.2.0-orange)](https://xgboost.readthedocs.io/)
 [![License](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+[![Pairs](https://img.shields.io/badge/pairs-20-blueviolet)](https://github.com/andreans27/mimia-quant)
 
-> **Mimia** is a machine-learning-driven quantitative trading system for Binance Crypto Perpetual Futures. It trades both long and short using a multi-timeframe XGBoost ensemble, with real-time signal generation, position management, and edge decay monitoring — all running autonomously via scheduled cron jobs.
+> **Mimia** is a machine-learning-driven quantitative trading system for Binance Crypto Perpetual Futures. It trades both long and short using a multi-timeframe XGBoost ensemble, with real-time signal generation, position management, and edge decay monitoring — all running autonomously via scheduled cron jobs on the Binance Testnet.
 
 ---
 
@@ -15,13 +16,19 @@
 | Metric | Value |
 |--------|-------|
 | **Mode** | 🟡 Live Trading (Testnet) |
-| **Capital** | ~$4,996 USDT |
-| **Pairs** | 10 (APT, UNI, FET, TIA, SOL, OP, 1000PEPE, SUI, ARB, INJ) |
+| **Capital** | $5,000 USDT |
+| **Pairs** | 20 (see below) |
 | **Strategy** | Multi-TF XGBoost Ensemble (5m, 15m, 30m, 1h, 4h) |
-| **Signal Threshold** | 0.60 (optimal via grid scan) |
-| **Avg Win Rate (backtest)** | 70–82.5% across symbols |
+| **Signal Threshold** | 0.60 (optimal via grid scan across 12 symbols) |
+| **Avg Win Rate (retrained pairs)** | 76.9–88.4% across symbols |
 | **Scan Interval** | Every 60 minutes |
-| **Open Positions** | 3 (SOL, 1000PEPE, ARB) — all LONG |
+| **Open Positions** | 0 (fresh start after architecture update) |
+
+### Active Pairs
+
+**Retrained (WR ≥ 76.9%):** ENA, SUI, OP, FET, TIA, WIF, DOGE, SOL, SEI, NEAR, ADA, AAVE, WLD
+
+**Legacy (existing ensemble models):** 1000PEPE, ARB, INJ, AVAX, BNB, ETH, LINK
 
 ---
 
@@ -32,6 +39,7 @@
 - **372 engineered features** — price action, volatility, volume profile, microstructure, and regime indicators
 - **Threshold‑optimized entries** — grid scan over 0.50–0.90 for optimal Sharpe/WR/DD tradeoff per symbol
 - **Overfitting controls** — feature subsampling, strong L1/L2 regularization (α=1.0, λ=3.0), walk‑forward validation, independent OOS sets
+- **Automated retraining pipeline** — hourly cron job monitors edge decay and triggers retraining when performance degrades
 
 ### Bidirectional Trading
 - No directional bias — evaluates long and short setups with identical rigor
@@ -43,52 +51,74 @@
 - **Multi‑stage kill switches** — 3% daily DD → 50% size cut, 5% → halt, 8% monthly → full audit
 - **Correlated position tracking** — correlated assets counted as single exposure
 - **Staged entries** — 2–3 tranches for larger positions
-- **5x max leverage** (10x on testnet for signal‑to‑noise)
+- **10x leverage max** on testnet; Kelly‑fractional automatic position sizing
 
 ### Production‑Grade Tooling
-- **Binance Testnet Integration** — real order execution on paper environment
-- **Telegram Reporting** — daily reports via Telegram bot
-- **Cron‑Based Scheduling** — autonomous signal scan every 60 minutes
+- **Binance Testnet Integration** — real order execution on paper environment with accurate fee & slippage modeling
+- **Telegram Reporting** — automated reports every 5-minute daemon cycle via Telegram bot
+- **Cron‑Based Scheduling** — autonomous signal scan every 60 minutes with hourly retraining monitor
 - **SQLite Persistence** — trade log, capital history, signal records
-- **CI/CD Pipeline** — GitHub Actions with linting, testing, package build, and pre‑deploy validation
+- **CI/CD Pipeline** — GitHub Actions with linting, testing, security scan, and pre‑deploy validation
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-┌──────────────────────────────────────────────────────┐
-│                   Cron Scheduler                      │
-│           Every 60 min → python main.py               │
-├──────────────────────────────────────────────────────┤
-│               Live Trading Engine                       │
-│  ┌──────────┐  ┌──────────┐  ┌────────────────────┐  │
-│  │ Signal    │  │ Position │  │ Risk /             │  │
-│  │ Pipeline  │→ │ Manager  │→ │ Position Sizing    │  │
-│  │ (ML Ens.) │  │          │  │ (Kelly 0.25)       │  │
-│  └──────────┘  └──────────┘  └────────────────────┘  │
-├──────────────────────────────────────────────────────┤
-│                   Data Layer                          │
-│  ┌──────────┐  ┌──────────┐  ┌────────────────────┐  │
-│  │ Parquet  │  │ SQLite   │  │ Binance REST       │  │
-│  │ Cache    │→ │ DB       │→ │ Client (Testnet)   │  │
-│  └──────────┘  └──────────┘  └────────────────────┘  │
-├──────────────────────────────────────────────────────┤
-│                   Infrastructure                      │
-│  ┌──────────┐  ┌──────────┐  ┌────────────────────┐  │
-│  │ GitHub   │  │ Telegram │  │ Hermes Cron        │  │
-│  │ Actions  │  │ Bot      │  │ Scheduler          │  │
-│  └──────────┘  └──────────┘  └────────────────────┘  │
-└──────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        Cron Scheduler                             │
+│          ┌──────────────────────┐  ┌────────────────────────────┐ │
+│          │ Signal Scan (hourly) │  │ Retrain Monitor (hourly)   │ │
+│          │ → python main.py     │  │ → auto_retrain.py          │ │
+│          └──────────┬───────────┘  └──────────┬─────────────────┘ │
+├─────────────────────┼─────────────────────────┼───────────────────┤
+│                     ▼                         ▼                    │
+│              Live Trading Engine                                │
+│  ┌──────────┐  ┌──────────┐  ┌────────┐  ┌──────────────────┐  │
+│  │ Signal    │  │ Position │  │ Kelly  │  │ Regime /         │  │
+│  │ Pipeline  │→│ Manager  │→│ Sizer  │→│ Exit Strategy    │  │
+│  │ (ML Ens.) │  │          │  │        │  │ (ATR/SMA/Hold)   │  │
+│  └──────────┘  └──────────┘  └────────┘  └──────────────────┘  │
+├──────────────────────────────────────────────────────────────────┤
+│                        Data Layer                                 │
+│  ┌────────────┐  ┌──────────────┐  ┌──────────────────────────┐ │
+│  │ Parquet    │  │ SQLite       │  │ Binance REST Client      │ │
+│  │ Feature    │→│ Trade/State  │→│ (Testnet — get_order      │ │
+│  │ Cache      │  │ DB           │  │  polling, accurate PnL)  │ │
+│  └────────────┘  └──────────────┘  └──────────────────────────┘ │
+├──────────────────────────────────────────────────────────────────┤
+│                    Infrastructure                                  │
+│  ┌──────────┐  ┌────────────┐  ┌──────────┐  ┌───────────────┐ │
+│  │ GitHub   │  │ Telegram   │  │ Hermes   │  │ ML Models     │ │
+│  │ Actions  │  │ Bot        │  │ Cron     │  │ (data/ml_*   )│ │
+│  └──────────┘  └────────────┘  └──────────┘  └───────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-### Component Breakdown
+### Directory Structure
 
-| Layer | Component | Description |
-|-------|-----------|-------------|
-| **Domain** | `strategy.py`, `signal.py` | Core business logic — signal generation, edge detection |
-| **Application** | `src/trading/` (state, signals, engine, reporter) | Orchestrates signal evaluation, trade execution, risk checks |
-| **Infrastructure** | `binance_sdk`, `sqlite`, `telegram` | Exchange connectivity, persistence, notifications |
+```
+mimia-quant/
+├── src/
+│   ├── strategies/     # Kelly sizer, regime filters, exit strategies
+│   ├── trading/        # Engine, state, signals, reporter
+│   ├── training/       # ML training pipeline (tf_specific, ml_ensemble)
+│   ├── backtesting/    # Backtest engine, exit strategy comparison
+│   └── core/           # Database, Redis client, base models
+├── scripts/
+│   ├── trading/        # Daemon launcher (live_trader_daemon.sh)
+│   ├── operations/     # Cron orchestrator, Telegram reporter
+│   ├── optimization/   # Threshold scans, regime filter backtests
+│   └── training/       # Auto-retrain, batch eval, rapid eval
+├── config/
+│   ├── config.yaml     # System configuration
+│   └── strategies.yaml # Strategy definitions
+├── data/
+│   ├── ml_models/      # Trained XGBoost models (20 symbols × 25 models)
+│   ├── ml_cache/       # Feature cache (Parquet)
+│   └── cron_output/    # Scheduled job output logs
+└── tests/              # 69 unit tests (pytest)
+```
 
 ---
 
@@ -108,7 +138,7 @@ Grid Threshold Scan (0.50–0.90)
         ↓
 Optimal Threshold Selected → Live Trade
 
-16 symbols × 25 models = 400 models total
+20 symbols × 25 models = 500 models total
 ```
 
 ### Model Architecture
@@ -116,21 +146,27 @@ Optimal Threshold Selected → Live Trade
 - **Architecture**: depth=3, 300 estimators, L1+L2 regularization
 - **Ensemble**: 5 timeframes × 5 seeds = 25 models per symbol; probability averaged across all
 - **Feature Groups**: price action (120), volatility (60), volume (60), microstructure (72), regime (60)
+- **Voting Pipeline**: all 25 models vote, probability threshold 0.60 for entry
 
-### Performance (Backtest — All 8/8 Symbols Passed)
+### Performance (Backtest — Top Retrained Pairs)
 
-| Symbol | Win Rate | Profit Factor | Monthly Return | Max DD |
-|--------|----------|---------------|----------------|--------|
-| APT | 82.5% | 10.1 | 33.4% | <0.35% |
-| UNI | 80.1% | 8.4 | 28.2% | <0.35% |
-| FET | 79.5% | 6.7 | 25.1% | <0.35% |
-| TIA | 79.5% | 5.9 | 24.8% | <0.35% |
-| SOL | 77.3% | 4.8 | 22.1% | <0.35% |
-| OP | 76.1% | 4.2 | 19.7% | <0.35% |
-| SUI | 75.6% | 3.9 | 18.5% | <0.35% |
-| ARB | 75.1% | 3.8 | 18.0% | <0.35% |
+| Symbol | Win Rate | Profit Factor | Monthly Return | Max DD (OOS) |
+|--------|----------|---------------|----------------|--------------|
+| NEAR   | 88.4%    | 29.1          | 35.2%          | 0.12%        |
+| ENA    | 87.3%    | 27.3          | 34.1%          | 0.14%        |
+| ADA    | 87.0%    | 29.6          | 33.8%          | 0.11%        |
+| SUI    | 86.9%    | 30.5          | 33.5%          | <0.35%       |
+| WLD    | 84.8%    | 17.2          | 28.7%          | 0.37%        |
+| OP     | 84.6%    | 22.1          | 28.2%          | <0.35%       |
+| FET    | 82.7%    | 12.0          | 25.1%          | <0.35%       |
+| AAVE   | 81.9%    | 16.2          | 24.9%          | 0.22%        |
+| TIA    | 81.4%    | 11.6          | 24.8%          | <0.35%       |
+| WIF    | 80.8%    | 10.6          | 22.8%          | 0.08%        |
+| SEI    | 80.7%    | 14.0          | 22.5%          | 0.14%        |
+| DOGE   | 80.3%    | 13.9          | 21.5%          | <0.35%       |
+| SOL    | 76.9%    | 12.1          | 21.1%          | <0.35%       |
 
-~0.35% max DD achieved through probability-based position sizing with strong risk management.
+**Legacy pairs** (1000PEPE, ARB, INJ, AVAX, BNB, ETH, LINK) retained with their original ensemble models — scheduled for retraining in next cycle.
 
 ---
 
@@ -170,7 +206,7 @@ python main.py
 Or deploy as a cron job (runs automatically every 60 min):
 ```bash
 # Via Hermes cron scheduler
-# cron schedule: every 1h
+# cron_hourly.py orchestrates signal scan + retrain monitor
 ```
 
 ---
@@ -180,11 +216,11 @@ Or deploy as a cron job (runs automatically every 60 min):
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `INITIAL_CAPITAL` | 5,000 USDT | Starting capital for live trading |
-| `LEVERAGE_X` | 10 | Leverage (testnet only) |
-| `RISK_PER_TRADE` | 1% | Max risk per position |
+| `LEVERAGE_X` | 10 | Leverage (testnet; controlled by Kelly sizer) |
+| `MARGIN_PCT` | 1% | Max margin per position (Kelly-scaled) |
 | `SIGNAL_THRESHOLD` | 0.60 | Minimum ensemble probability to enter |
-| `COOLDOWN_BARS` | 12 | Time before re-evaluating same symbol |
-| `HOLD_BARS` | 12 | Max hold time before auto-close |
+| `COOLDOWN_BARS` | 3 | Wait 15 min between trades on same symbol |
+| `HOLD_BARS` | 9 | Max hold time (~45 min at 5m bars) |
 
 ---
 
@@ -192,8 +228,8 @@ Or deploy as a cron job (runs automatically every 60 min):
 
 Every push to `main` triggers:
 
-1. 🔍 **Lint & Type Check** — flake8, mypy
-2. 🧪 **Unit Tests** — pytest (69 tests)
+1. 🔍 **Lint & Type Check** — black, flake8, mypy
+2. 🧪 **Unit Tests** — pytest (69 tests, including database & Redis mocks)
 3. 🔒 **Security Scan** — bandit
 4. 📦 **Build Package** — python -m build
 5. ✅ **Pre-Deploy Validation** — YAML config verification
@@ -206,26 +242,27 @@ Every push to `main` triggers:
 | Technology | Purpose |
 |------------|---------|
 | Python 3.11 | Core runtime |
-| XGBoost 3.2.0 | Gradient-boosted ML models |
-| Pandas 3.0 | Data processing & feature engineering |
-| NumPy 2.4 | Numerical computation |
-| PyTorch 2.11 | RL position sizer (DQN) |
+| XGBoost | Gradient-boosted ML models |
+| Pandas | Data processing & feature engineering |
 | SQLite | Trade & capital persistence |
 | GitHub Actions | CI/CD pipeline |
-| Binance Testnet | Paper trading execution |
+| Binance Testnet SDK | Paper trading execution |
+| Telegram Bot API | Automated reporting |
 
 ---
 
 ## 📋 Roadmap
 
-- [x] ML pipeline — Multi-TF XGBoost ensemble
-- [x] Live trading engine — live testnet integration
-- [x] Risk management — Kelly sizing + kill switches
+- [x] ML pipeline — Multi-TF XGBoost ensemble (20 symbols, 500 models)
+- [x] Live trading engine — Testnet integration with accurate PnL
+- [x] Risk management — Kelly sizing + kill switches + regime filters
 - [x] CI/CD — GitHub Actions pipeline
-- [ ] Live deployment — mainnet with reduced sizing
-- [ ] RL optimizer — DQN-based position sizing (in progress)
-- [ ] Edge decay monitoring — rolling 30/60/90-day performance windows
-- [ ] Telegram daily reporting — automated daily P&L summaries
+- [x] Auto-retraining — Periodic model refresh on edge decay
+- [x] Telegram reporting — Automated daemon-cycle reports
+- [ ] Live deployment — Mainnet with reduced sizing
+- [ ] RL optimizer — DQN-based position sizing (BTC baseline: +1.36%)
+- [ ] Edge decay monitoring — Rolling 30/60/90-day performance windows
+- [ ] Portfolio-level correlation management — Dynamic exposure caps
 
 ---
 
