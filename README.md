@@ -59,7 +59,7 @@
 ```
 ┌──────────────────────────────────────────────────────┐
 │                   Cron Scheduler                      │
-|           Every 60 min → scripts/trading/live_trader.py               │
+│           Every 60 min → python main.py               │
 ├──────────────────────────────────────────────────────┤
 │               Live Trading Engine                       │
 │  ┌──────────┐  ┌──────────┐  ┌────────────────────┐  │
@@ -87,7 +87,7 @@
 | Layer | Component | Description |
 |-------|-----------|-------------|
 | **Domain** | `strategy.py`, `signal.py` | Core business logic — signal generation, edge detection |
-| **Application** | `scripts/trading/live_trader.py` | Orchestrates signal evaluation, trade execution, risk checks |
+| **Application** | `src/trading/` (state, signals, engine, reporter) | Orchestrates signal evaluation, trade execution, risk checks |
 | **Infrastructure** | `binance_sdk`, `sqlite`, `telegram` | Exchange connectivity, persistence, notifications |
 
 ---
@@ -163,9 +163,8 @@ make test
 
 ### Start Live Trading
 
-
 ```bash
-python scripts/trading/live_trader.py
+python main.py
 ```
 
 Or deploy as a cron job (runs automatically every 60 min):

@@ -40,7 +40,7 @@ while true; do
 
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] === Run #${RUN_COUNT} (${MODE}) ===" | tee -a "$LOG_FILE"
 
-    python scripts/trading/live_trader.py ${MODE} >> "$LOG_FILE" 2>&1 || true
+    python main.py ${MODE} >> "$LOG_FILE" 2>&1 || true
 
     END_TS=$(date +%s)
     ELAPSED=$((END_TS - START_TS))

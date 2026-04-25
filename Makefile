@@ -15,19 +15,19 @@ typecheck:
 	mypy src/ --ignore-missing-imports
 
 backtest:
-	python3 scripts/backtesting/run_backtest.py
+	PYTHONPATH=. python3 src/backtesting/run_backtest.py
 
 run:
-	python3 scripts/trading/run_bot.py
+	PYTHONPATH=. python3 -m scripts.trading.live_trader
 
 report:
-	python3 scripts/trading/live_trader.py --report --testnet
+	PYTHONPATH=. python3 main.py report --testnet
 
 cron-setup:
-	@echo "Use cronjob tool or 'crontab -e' directly to schedule: python3 scripts/trading/live_trader.py"
+	@echo "Use cronjob tool to schedule hourly: PYTHONPATH=. python3 main.py trade --testnet"
 
 init-db:
-	python3 scripts/trading/init_db.py
+	PYTHONPATH=. python3 src/trading/init_db.py
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

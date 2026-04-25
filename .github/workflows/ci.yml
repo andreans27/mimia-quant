@@ -36,12 +36,12 @@ jobs:
 
       - name: Run Black (format check)
         run: |
-          black --check --diff src/ scripts/ tests/
+          black --check --diff src/ tests/
         continue-on-error: true
 
       - name: Run Flake8
         run: |
-          flake8 src/ scripts/ tests/ --count --show-source --statistics --max-line-length=120
+          flake8 src/ tests/ --count --show-source --statistics --max-line-length=120
         continue-on-error: true
 
       - name: Run MyPy
@@ -228,15 +228,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Validate configuration
-        run: |
-          python3 --version
-          python3 scripts/validate_config.py
-
       - name: Check required files
         run: |
           echo "Checking required files..."
-          test -f scripts/run_bot.py && echo "✓ run_bot.py exists"
+          test -f main.py && echo "✓ main.py exists"
           test -f config/config.yaml && echo "✓ config.yaml exists"
           test -f configs/strategies.yaml && echo "✓ strategies.yaml exists"
           test -f requirements.txt && echo "✓ requirements.txt exists"

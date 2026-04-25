@@ -133,7 +133,7 @@ def run_ensemble_backtest(symbol: str,
                           warmup_bars: int = 200) -> dict:
     """Run ensemble backtest on 5m data with pure signal approach."""
     from src.strategies.backtester import BacktestTrade, TradeDirection
-    from scripts.backtesting.run_full_backtest import compute_metrics, check_criteria
+    from src.backtesting.run_full_backtest import compute_metrics, check_criteria
     from src.utils.binance_client import BinanceRESTClient
     
     # --- 1. Fetch 5m OHLCV ---
