@@ -74,20 +74,99 @@ class LiveTrader:
         except Exception:
             return False
 
+    def _get_binance_positions(self) -> Dict[str, Dict]:
+        """Get actual open positions from Binance (testnet or mainnet).
+
+        Returns a dict keyed by symbol with position details for symbols
+        that have non-zero positions on Binance.
+        """
+        binance_positions = {}
+        try:
+            client = self._get_client()
+            positions = client.get_position_info()
+            for p in positions:
+                sym = p.get('symbol', '').upper()
+                if sym not in LIVE_SYMBOLS:
+                    continue
+                pos_amt = float(p.get('position_amt', 0))
+                if abs(pos_amt) < 0.001:
+                    continue
+                direction = 1 if pos_amt > 0 else -1
+                notional = float(p.get('notional', 0))
+                entry_price = abs(notional / pos_amt) if pos_amt != 0 else 0
+                binance_positions[sym] = {
+                    'direction': direction,
+                    'qty': abs(pos_amt),
+                    'entry_price': entry_price,
+                }
+                print(f"    🔍 Binance position: {sym} {'LONG' if direction==1 else 'SHORT'} qty={abs(pos_amt):.4f} entry=${entry_price:.4f}")
+            return binance_positions
+        except Exception as e:
+            print(f"  ⚠️ Could not fetch Binance positions: {e}")
+            return {}
+
+    @staticmethod
+    def _calc_hold_remaining(entry_time_ms: int) -> int:
+        """Calculate hold_remaining based on elapsed time since entry.
+
+        Each bar = 5 minutes (300,000 ms). HOLD_BARS=9 = ~45 min.
+        For unknown entry times (0), return full HOLD_BARS.
+        """
+        if entry_time_ms == 0:
+            return HOLD_BARS
+        elapsed_ms = int(time.time() * 1000) - entry_time_ms
+        elapsed_bars = elapsed_ms // 300_000  # 5 min per bar
+        return max(1, HOLD_BARS - elapsed_bars)
+
     def _setup_live_trading(self):
-        """Reset stale positions in DB and init leverage for all symbols."""
+        """Reset stale positions in DB and init leverage for all symbols.
+
+        Only resets DB positions that do NOT have a corresponding open position
+        on Binance. Positions that are active on Binance are preserved, and
+        hold_remaining is calculated from actual elapsed time since entry.
+        """
         net = self.network
         c = self.conn.cursor()
 
-        # Check if we need initial setup (schema_version flag)
-        c.execute("SELECT COUNT(*) FROM live_state WHERE position != 0")
-        stale = c.fetchone()[0]
+        # First, get actual open positions from Binance
+        binance_positions = self._get_binance_positions()
 
-        if stale > 0:
-            print(f"\n  ⚠️ Found {stale} stale position(s) in DB (from old runs). Resetting...")
-            c.execute("UPDATE live_state SET position=0, entry_price=0, entry_time=0, entry_proba=0, hold_remaining=0, cooldown_remaining=0, qty=0 WHERE position != 0")
-            self.conn.commit()
-            print(f"  ✅ Stale positions reset. New positions will be placed as real orders on Binance {net}.")
+        # Check for stale DB positions (in DB but NOT on Binance)
+        c.execute("SELECT symbol, position, qty FROM live_state WHERE position != 0")
+        db_stale = c.fetchall()
+
+        reset_count = 0
+        keep_count = 0
+        for sym, pos, qty in db_stale:
+            if sym in binance_positions:
+                # Position is legitimately open on Binance — keep it
+                keep_count += 1
+                bp = binance_positions[sym]
+                # Check existing DB entry_time to calculate real hold_remaining
+                c.execute("SELECT entry_time FROM live_state WHERE symbol=?", (sym,))
+                existing_entry = c.fetchone()
+                db_entry_time = existing_entry[0] if existing_entry and existing_entry[0] else 0
+                entry_time = db_entry_time if db_entry_time > 0 else int(time.time() * 1000)
+                hold = self._calc_hold_remaining(entry_time)
+                c.execute("""
+                    UPDATE live_state
+                    SET position=?, qty=?, entry_price=?, entry_time=?,
+                        hold_remaining=?, cooldown_remaining=0
+                    WHERE symbol=?
+                """, (bp['direction'], bp['qty'], bp['entry_price'],
+                      entry_time, hold, sym))
+            else:
+                # Position exists in DB but NOT on Binance — reset it
+                reset_count += 1
+                print(f"  ⚠️ Stale DB position: {sym} (not on Binance {net}). Resetting...")
+                c.execute("UPDATE live_state SET position=0, entry_price=0, entry_time=0, entry_proba=0, hold_remaining=0, cooldown_remaining=0, qty=0 WHERE symbol=?", (sym,))
+
+        if keep_count > 0:
+            print(f"  ✅ Preserved {keep_count} active position(s) matching Binance {net}")
+        if reset_count > 0:
+            print(f"  ✅ Reset {reset_count} stale DB position(s) (not on Binance {net})")
+
+        self.conn.commit()
 
         # Init leverage 10x for all symbols
         ok = 0
@@ -96,9 +175,42 @@ class LiveTrader:
                 ok += 1
         print(f"  ✅ Leverage 10x set for {ok}/{len(LIVE_SYMBOLS)} symbols")
 
+    def _sync_wallet_balance(self) -> float:
+        """Sync capital tracking with real Binance wallet balance.
+
+        Queries Binance account info and updates the live_capital table
+        with the actual wallet balance (including unrealized PnL).
+        Returns the synced balance, or 0 if sync fails.
+        """
+        try:
+            client = self._get_client()
+            acct = client.get_account_info()
+            total_margin = float(acct.get('total_margin_balance', 0))
+            # Use total_margin_balance (wallet + unrealized PnL) for accurate capital tracking
+            balance = total_margin if total_margin > 0 else float(acct.get('total_wallet_balance', 0))
+            if balance > 0:
+                now_ms = int(time.time() * 1000)
+                c = self.conn.cursor()
+                c.execute("""
+                    INSERT INTO live_capital (timestamp, capital, peak_capital)
+                    VALUES (?, ?, ?)
+                """, (now_ms, balance, balance))
+                self.conn.commit()
+                print(f"  💰 Wallet synced: ${balance:.2f} (from Binance {self.network})")
+                return balance
+            else:
+                print(f"  ⚠️ Wallet balance from Binance is 0 — keeping DB capital")
+                return 0
+        except Exception as e:
+            print(f"  ⚠️ Wallet sync failed: {e}")
+            return 0
+
     def _sync_binance_positions(self):
         """Sync DB state with actual open positions on Binance (mainnet or testnet).
-        Prevents duplicate position entries when script restarts."""
+
+        Calculates hold_remaining from actual elapsed time since entry_time
+        instead of resetting to full HOLD_BARS on every restart.
+        """
         try:
             client = self._get_client()
             positions = client.get_position_info()
@@ -115,13 +227,19 @@ class LiveTrader:
                 direction = 1 if pos_amt > 0 else -1
                 qty = abs(pos_amt)
                 entry_price = abs(notional / pos_amt) if pos_amt != 0 else 0
+                # Check existing DB entry_time to calculate real hold_remaining
+                c.execute("SELECT entry_time FROM live_state WHERE symbol=?", (sym,))
+                existing_entry = c.fetchone()
+                db_entry_time = existing_entry[0] if existing_entry and existing_entry[0] else 0
+                entry_time = db_entry_time if db_entry_time > 0 else int(time.time() * 1000)
+                hold = self._calc_hold_remaining(entry_time)
                 # Update DB state to match Binance
                 c.execute("""
                     UPDATE live_state
                     SET position=?, qty=?, entry_price=?, entry_time=?,
                         hold_remaining=?, cooldown_remaining=0
                     WHERE symbol=?
-                """, (direction, qty, entry_price, int(time.time() * 1000), 9, sym))
+                """, (direction, qty, entry_price, entry_time, hold, sym))
                 synced += 1
             self.conn.commit()
             if synced > 0:
@@ -211,6 +329,15 @@ class LiveTrader:
         # Initial setup: reset stale positions (from old runs) and init leverage
         self._setup_live_trading()
 
+        # Sync wallet balance with real Binance balance (incl. unrealized PnL)
+        synced_balance = self._sync_wallet_balance()
+        if synced_balance > 0 and synced_balance != capital:
+            print(f"    Capital updated: ${capital:.2f} → ${synced_balance:.2f}")
+            capital = synced_balance
+            peak_capital = max(peak_capital, capital)
+            # Re-save to DB with the synced value as peak
+            update_capital(self.conn, capital, peak_capital)
+
         # Sync DB state with actual positions on Binance ({self.network})
         # Prevents duplicate entries if trader restarts mid-position
         self._sync_binance_positions()
@@ -288,11 +415,10 @@ class LiveTrader:
         log_run(self.conn, duration_ms, signals_total, trades_opened,
                 trades_closed, capital, peak_capital, dd)
 
-        # Send Telegram report
-        if trade_report_lines or self.report_mode:
-            msg = self._build_report(capital, peak_capital, dd, trades_opened,
-                                     trades_closed, trade_report_lines)
-            self.send_telegram(msg)
+        # Send Telegram report (every run, even if no trades)
+        msg = self._build_report(capital, peak_capital, dd, trades_opened,
+                                 trades_closed, trade_report_lines)
+        self.send_telegram(msg)
 
         return capital, peak_capital, dd
 
@@ -325,8 +451,19 @@ class LiveTrader:
             print(f"    ⚠️ Orderbook fetch failed: {e}")
             price_ref = 50000.0  # fallback
 
-        # Calculate position size: 1% margin × 10x leverage = 10% exposure
-        position_value = capital * MARGIN_PCT * LEVERAGE_X
+        # Calculate position size: use Kelly sizing from DB, fallback to fixed 10%
+        try:
+            from src.strategies.kelly_sizer import KellySizer
+            kelly = KellySizer()
+            sizes = kelly.get_all_positions([symbol])
+            if symbol in sizes:
+                kelly_pct = sizes[symbol].get('position_pct', 0.10)
+            else:
+                kelly_pct = MARGIN_PCT * LEVERAGE_X  # 0.10 default
+        except Exception:
+            kelly_pct = MARGIN_PCT * LEVERAGE_X
+        kelly_pct = max(0.02, min(kelly_pct, 0.25))  # cap 2%–25%
+        position_value = capital * kelly_pct
         raw_qty = position_value / price_ref
 
         # Round qty to LOT_SIZE step_size for the symbol
@@ -359,6 +496,7 @@ class LiveTrader:
 
         side = "BUY" if direction == 1 else "SELL"
         order_placed = False
+        executed_qty_actual = 0.0
         try:
             # Place real order on Binance
             order_resp = client.place_order(
@@ -367,20 +505,32 @@ class LiveTrader:
                 order_type="MARKET",
                 quantity=qty,
             )
-            order_id = order_resp.get('order_id', '?')
-            status = order_resp.get('status', 'N/A')
-            executed_qty = float(order_resp.get('executed_qty', 0))
-            avg_price_raw = float(order_resp.get('avg_price', 0))
+            order_id = order_resp.get('order_id')
+            if order_id is None or order_id == '?':
+                order_id = order_resp.get('client_order_id')
+            status_code = order_resp.get('status', 'N/A')
 
-            if executed_qty > 0 and avg_price_raw > 0:
-                # Order filled — use avg_price
-                entry_price = avg_price_raw
-                order_placed = True
-                print(f"    📡 ORDER FILLED: {side} {symbol} qty={executed_qty} @ ${avg_price_raw:.4f} (order #{order_id})")
-            else:
-                # Order response shows NEW/unfilled — Binance has delayed fill updates
-                # Wait briefly, then check if position was actually created
-                time.sleep(2)
+            # Poll get_order() for actual fill data (up to 3 attempts, 1s apart)
+            for attempt in range(3):
+                time.sleep(1)
+                try:
+                    fill_resp = client.get_order(symbol=symbol, order_id=order_id)
+                    if isinstance(fill_resp, dict):
+                        fill_status = fill_resp.get('status', '')
+                        ex_qty = float(fill_resp.get('executed_qty', 0))
+                        avg_px = float(fill_resp.get('avg_price', 0))
+                        if fill_status == 'FILLED' and ex_qty > 0 and avg_px > 0:
+                            entry_price = avg_px
+                            executed_qty_actual = ex_qty
+                            order_placed = True
+                            print(f"    📡 ORDER FILLED: {side} {symbol} qty={ex_qty:.6f} @ ${avg_px:.4f} (order #{order_id})")
+                            break
+                except Exception:
+                    pass
+
+            if not order_placed:
+                # Fallback: check position info on Binance
+                time.sleep(1)
                 actual_pos = None
                 try:
                     positions = client.get_position_info()
@@ -397,19 +547,23 @@ class LiveTrader:
                     pos_amt = float(actual_pos.get('position_amt', 0))
                     notional = float(actual_pos.get('notional', 0))
                     entry_price = abs(notional / pos_amt) if pos_amt != 0 else price_ref
+                    executed_qty_actual = pos_amt
                     order_placed = True
-                    print(f"    📡 ORDER FILLED (delayed): {side} {symbol} {pos_amt:.4f} @ notional=${notional:.2f} avg=${entry_price:.4f}")
+                    print(f"    📡 ORDER FILLED (position): {side} {symbol} {pos_amt:.4f} @ notional=${notional:.2f} avg=${entry_price:.4f}")
                 else:
                     # Genuinely not filled — use orderbook price
                     entry_price = price_ref * (1 + SLIPPAGE) if direction == 1 else price_ref * (1 - SLIPPAGE)
-                    print(f"    📡 ORDER SUBMITTED (pending): {side} {symbol} order #{order_id} status={status} — using orderbook price ${entry_price:.4f}")
+                    print(f"    📡 ORDER SUBMITTED (pending): {side} {symbol} order #{order_id} status={status_code} — using orderbook price ${entry_price:.4f}")
         except Exception as e:
             print(f"    ⚠️ Binance order failed (fallback): {e}")
             # Simulated fallback: use orderbook price with slippage
             entry_price = price_ref * (1 + SLIPPAGE) if direction == 1 else price_ref * (1 - SLIPPAGE)
 
-        # Apply fee
-        entry_cost = entry_price * qty * TAKER_FEE
+        # Use actual executed qty from Binance when available
+        final_qty = executed_qty_actual if executed_qty_actual > 0 else qty
+
+        # Apply fee using actual fill data
+        entry_cost = entry_price * final_qty * TAKER_FEE
 
         state['position'] = direction
         state['entry_price'] = entry_price
@@ -417,7 +571,7 @@ class LiveTrader:
         state['entry_proba'] = proba
         state['hold_remaining'] = HOLD_BARS
         state['cooldown_remaining'] = 0
-        state['qty'] = qty
+        state['qty'] = final_qty
 
         # Deduct entry fee from capital
         capital -= entry_cost
@@ -449,24 +603,35 @@ class LiveTrader:
                 order_type="MARKET",
                 quantity=qty,
             )
-            order_id = order_resp.get('order_id', '?')
-            executed_qty = float(order_resp.get('executed_qty', 0))
-            avg_price_raw = float(order_resp.get('avg_price', 0))
+            order_id = order_resp.get('order_id')
+            if order_id is None or order_id == '?':
+                order_id = order_resp.get('client_order_id')
 
-            if executed_qty > 0 and avg_price_raw > 0:
-                exit_price = avg_price_raw
-                print(f"    📡 EXIT ORDER FILLED: {side} {symbol} qty={executed_qty} @ ${avg_price_raw:.4f} (order #{order_id})")
-            else:
-                # Order response shows NEW/unfilled — check actual position
-                status = order_resp.get('status', 'N/A')
-                time.sleep(2)
+            # Poll get_order() for actual fill data (up to 3 attempts, 1s apart)
+            for attempt in range(3):
+                time.sleep(1)
+                try:
+                    fill_resp = client.get_order(symbol=symbol, order_id=order_id)
+                    if isinstance(fill_resp, dict):
+                        fill_status = fill_resp.get('status', '')
+                        ex_qty = float(fill_resp.get('executed_qty', 0))
+                        avg_px = float(fill_resp.get('avg_price', 0))
+                        if fill_status == 'FILLED' and ex_qty > 0 and avg_px > 0:
+                            exit_price = avg_px
+                            print(f"    📡 EXIT ORDER FILLED: {side} {symbol} qty={ex_qty:.6f} @ ${avg_px:.4f} (order #{order_id})")
+                            break
+                except Exception:
+                    pass
+
+            if exit_price is None:
+                # Fallback: check position info
+                time.sleep(1)
                 try:
                     positions = client.get_position_info()
                     for p in positions:
                         if p.get('symbol') == symbol.upper():
                             pos_amt = float(p.get('position_amt', 0))
-                            # If LONG was closed: pos_amt should be 0 or reduced
-                            if abs(pos_amt) < abs(state.get('position', 0)) * 0.1:
+                            if abs(pos_amt) < qty * 0.1:
                                 print(f"    📡 EXIT POSITION CLOSED: {side} {symbol} remaining_pos={pos_amt:.4f} (order #{order_id})")
                                 break
                 except Exception:
@@ -477,7 +642,7 @@ class LiveTrader:
                     exit_price = float(ob['bids'][0][0]) * (1 - SLIPPAGE)
                 else:
                     exit_price = float(ob['asks'][0][0]) * (1 + SLIPPAGE)
-                print(f"    📡 EXIT ORDER SUBMITTED (pending): {side} {symbol} order #{order_id} status={status} — using orderbook price ${exit_price:.4f}")
+                print(f"    📡 EXIT (orderbook): {side} {symbol} order #{order_id} — using orderbook price ${exit_price:.4f}")
         except Exception as e:
             print(f"    ⚠️ Binance exit order failed (fallback): {e}")
             # Simulated fallback: get price from orderbook
@@ -496,10 +661,9 @@ class LiveTrader:
         else:
             raw_pnl = qty * (entry_price - exit_price)
 
-        # Fees on entry + exit
-        entry_cost = entry_price * qty * TAKER_FEE
+        # Exit fee only (entry fee already deducted at entry time)
         exit_cost = exit_price * qty * TAKER_FEE
-        pnl_net = raw_pnl - entry_cost - exit_cost
+        pnl_net = raw_pnl - exit_cost
 
         # PnL percent
         pnl_pct = pnl_net / capital * 100

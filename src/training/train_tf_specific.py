@@ -263,6 +263,169 @@ def train_tf_specific(symbol: str, tf_prefix: str, top_k: int = 50):
     return meta
 
 
+def train_tf_from_features(feat_df: pd.DataFrame, symbol: str, tf_prefix: str, top_k: int = 50) -> dict:
+    """
+    Train TF-specific ensemble using pre-computed features.
+    feat_df must contain 'target' column and feature columns with {tf_prefix}_ prefix.
+    Returns meta dict with metrics, or None on failure.
+
+    This is the core training function — used by auto_retrain.py instead of its old dumb trainer.
+    """
+    desc = TF_GROUPS[tf_prefix]['desc']
+    print(f"\n{'='*60}")
+    print(f"Training {symbol} — {desc} features")
+    print(f"{'='*60}")
+
+    # Extract TF-specific features from pre-computed feat_df
+    if 'target' not in feat_df.columns:
+        print(f"  ❌ No 'target' column in pre-computed features")
+        return None
+
+    X, y = get_tf_features(feat_df, tf_prefix)
+    if X is None:
+        return None
+
+    n = len(X)
+    train_size = int(n * 0.7)
+    val_size = int(n * 0.15)
+
+    X_train = X.iloc[:train_size]
+    y_train = y.iloc[:train_size]
+    X_val = X.iloc[train_size:train_size + val_size]
+    y_val = y.iloc[train_size:train_size + val_size]
+    X_test = X.iloc[train_size + val_size:]
+    y_test = y.iloc[train_size + val_size:]
+
+    # Feature selection
+    X_train_fs, X_val_fs, selected_features = select_features(X_train, y_train, X_val, top_k=top_k)
+    X_test_fs = X_test[selected_features]
+
+    for df_ in [X_train_fs, X_val_fs, X_test_fs]:
+        df_.fillna(0, inplace=True)
+        df_.clip(-10, 10, inplace=True)
+
+    models = []
+    all_metrics = {}
+
+    for seed in SEEDS:
+        hp = HPARAMS[seed]
+        np.random.seed(seed)
+        n_features = len(selected_features)
+
+        if n_features > 40:
+            feat_mask = np.random.choice([True, False], size=n_features, p=[0.75, 0.25])
+            model_features = [f for f, m in zip(selected_features, feat_mask) if m]
+        else:
+            model_features = selected_features
+
+        # Class balance
+        n_pos = (y_train == 1).sum()
+        n_neg = (y_train == 0).sum()
+        scale_pos = n_neg / max(n_pos, 1) if n_pos < n_neg else 1.0
+
+        params = {
+            'n_estimators': 300,
+            'max_depth': hp['max_depth'],
+            'learning_rate': hp['learning_rate'],
+            'subsample': hp['subsample'],
+            'colsample_bytree': hp['colsample_bytree'],
+            'reg_alpha': 0.1,
+            'reg_lambda': 1.0,
+            'min_child_weight': hp['min_child_weight'],
+            'scale_pos_weight': scale_pos,
+            'objective': 'binary:logistic',
+            'eval_metric': 'auc',
+            'early_stopping_rounds': 30,
+            'random_state': seed,
+            'verbosity': 0,
+        }
+
+        X_train_m = X_train_fs[model_features] if len(model_features) < len(selected_features) else X_train_fs
+        X_val_m = X_val_fs[model_features] if len(model_features) < len(selected_features) else X_val_fs
+
+        model = xgb.XGBClassifier(**params)
+        model.fit(X_train_m, y_train.loc[X_train_m.index],
+                  eval_set=[(X_val_m, y_val.loc[X_val_m.index])],
+                  verbose=False)
+
+        # Evaluate
+        X_test_m = X_test_fs[model_features] if len(model_features) < len(selected_features) else X_test_fs
+        y_prob = model.predict_proba(X_test_m)[:, 1]
+        y_pred = (y_prob >= 0.55).astype(int)
+
+        acc = accuracy_score(y_test, y_pred)
+        prec = precision_score(y_test, y_pred, zero_division=0)
+        rec = recall_score(y_test, y_pred, zero_division=0)
+        f1_v = f1_score(y_test, y_pred, zero_division=0)
+        auc = roc_auc_score(y_test, y_prob)
+
+        print(f"    Seed {seed:>3}: Acc={acc:.3f} Prec={prec:.3f} Rec={rec:.3f} F1={f1_v:.3f} AUC={auc:.3f} (feats={len(model_features)})")
+        all_metrics[seed] = {'accuracy': float(acc), 'precision': float(prec), 'recall': float(rec), 'f1': float(f1_v), 'auc': float(auc)}
+        models.append((str(seed), model, model_features))
+
+    # Ensemble evaluation
+    all_probs = []
+    for seed, model, mf in models:
+        X_test_m = X_test_fs[mf]
+        probs = model.predict_proba(X_test_m)[:, 1]
+        all_probs.append(probs)
+
+    avg_probs = np.mean(all_probs, axis=0)
+
+    # Best threshold by F1
+    best_f1 = 0
+    best_thresh = 0.50
+    for thresh in np.arange(0.35, 0.75, 0.01):
+        ens_pred = (avg_probs >= thresh).astype(int)
+        f1_val = f1_score(y_test, ens_pred, zero_division=0)
+        if f1_val > best_f1:
+            best_f1 = f1_val
+            best_thresh = thresh
+
+    # Save models
+    model_paths = {}
+    for seed, model, mf in models:
+        path = MODEL_DIR / f"{symbol}_{tf_prefix}_xgb_ens_{seed}.json"
+        model.save_model(str(path))
+        model_paths[str(seed)] = str(path)
+
+    meta = {
+        'symbol': symbol,
+        'tf_prefix': tf_prefix,
+        'ensemble_size': len(SEEDS),
+        'seeds': SEEDS,
+        'model_paths': model_paths,
+        'features': selected_features,
+        'model_features': {str(s): mf for s, mf in zip(SEEDS, [m[2] for m in models])},
+        'individual_metrics': all_metrics,
+        'ensemble_metrics': {
+            'best_threshold': float(best_thresh),
+            'test_auc': float(roc_auc_score(y_test, avg_probs)),
+            'test_precision_at_55': float(precision_score(y_test, (avg_probs >= 0.55).astype(int), zero_division=0)),
+            'test_accuracy_at_55': float(accuracy_score(y_test, (avg_probs >= 0.55).astype(int))),
+        },
+        'training_date': datetime.now().isoformat(),
+    }
+
+    meta_path = MODEL_DIR / f"{symbol}_{tf_prefix}_ensemble_meta.json"
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2, default=lambda x: float(x) if isinstance(x, (np.floating, np.integer)) else str(x))
+
+    print(f"\n  ✅ {tf_prefix} ensemble saved: {len(SEEDS)} models + metadata")
+    print(f"    Best thr={best_thresh:.2f}, AUC={meta['ensemble_metrics']['test_auc']:.3f}")
+    return meta
+
+
+# ─── Refactor original train_tf_specific to reuse new function ───
+
+def train_tf_specific(symbol: str, tf_prefix: str, top_k: int = 50):
+    """Original API — loads from cache, then delegates to train_tf_from_features."""
+    feat_df = load_cached_features(symbol)
+    if feat_df is None:
+        return None
+    return train_tf_from_features(feat_df, symbol, tf_prefix, top_k=top_k)
+
+
 def main():
     # TF groups to train (skip m5 — already have full model)
     tf_groups = ['m15', 'm30', 'h1', 'h4']

@@ -117,3 +117,6 @@ data/*.txt
 
 # Debug scripts
 debug_*.py
+
+# Cron output
+data/cron_output/

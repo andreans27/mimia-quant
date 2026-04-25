@@ -10,6 +10,7 @@ set -euo pipefail
 
 cd /root/projects/mimia-quant
 source venv/bin/activate
+export PYTHONPATH="/root/projects/mimia-quant:${PYTHONPATH:-}"
 
 LOG_FILE="data/live_trader_daemon.log"
 PID_FILE="data/live_trader_daemon.pid"

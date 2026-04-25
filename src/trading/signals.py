@@ -172,6 +172,8 @@ class SignalGenerator:
             for seed in SEEDS:
                 path = MODEL_DIR / f"{symbol}_xgb_ens_{seed}.json"
                 if not path.exists():
+                    path = MODEL_DIR / f"{symbol}_full_xgb_ens_{seed}.json"
+                if not path.exists():
                     continue
                 mf = meta.get('model_features', {}).get(str(seed), meta.get('features', []))
                 m = xgb.XGBClassifier()

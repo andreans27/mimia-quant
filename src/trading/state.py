@@ -25,10 +25,35 @@ CACHE_DIR = Path("data/ml_cache")
 MODEL_DIR = Path("data/ml_models")
 DB_PATH = Path("data/live_trading.db")
 
-# Top 10 pairs sorted by win rate from full backtest
+# Top 16 pairs sorted by retrain win rate + old-model pairs with ensemble_meta
+# (replaced UNI-54.8%/APT-60.3% → ENA-87.3%/WIF-80.8%/DOGE-80.3%)
+# Total 18 when counting all available models; scheduling 2 more (AAVE, WLD)
 LIVE_SYMBOLS = [
-    "APTUSDT", "UNIUSDT", "FETUSDT", "TIAUSDT", "SOLUSDT",
-    "OPUSDT", "1000PEPEUSDT", "SUIUSDT", "ARBUSDT", "INJUSDT",
+    # Retrained WR>70% (8 pairs)
+    "ENAUSDT",     # WR=87.3% PF=27.3
+    "SUIUSDT",     # WR=86.9% PF=30.5
+    "OPUSDT",      # WR=84.6% PF=22.1
+    "FETUSDT",     # WR=82.7% PF=12.0
+    "TIAUSDT",     # WR=81.4% PF=11.6
+    "WIFUSDT",     # WR=80.8% PF=10.6
+    "DOGEUSDT",    # WR=80.3% PF=13.9
+    "SOLUSDT",     # WR=76.9% PF=12.1
+    # Blue chip (replaced by SEI — higher WR)
+    "SEIUSDT",     # WR=80.7% PF=14.0 DD=0.14%
+    # Old-model pairs (7 pairs — have ensemble_meta + 5 TF×5 seeds)
+    "1000PEPEUSDT",
+    "ARBUSDT",
+    "INJUSDT",
+    "AVAXUSDT",
+    "BNBUSDT",
+    "ETHUSDT",
+    "LINKUSDT",
+    # New retrained top performers (replaced APT-60.3%, UNI-54.8%)
+    "NEARUSDT",    # WR=88.4% PF=29.1 DD=0.12%
+    "ADAUSDT",     # WR=87.0% PF=29.6 DD=0.11%
+    # New pairs (training in progress)
+    "AAVEUSDT",    # WR=81.9% PF=16.2 DD=0.22%
+    "WLDUSDT",     # WR=84.8% PF=17.2 DD=0.37%
 ]
 
 # Trading parameters (from optimal backtest sweep)

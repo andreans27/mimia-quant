@@ -37,15 +37,41 @@ TF_GROUPS = ['full', 'm15', 'm30', 'h1', 'h4']
 
 # ─── Exit strategy presets ───────────────────────────────────────────────
 EXIT_STRATEGIES = {
-    'baseline':       {'type': 'baseline',       'sl_pct': 0,    'tp_pct': 0,    'trail_pct': 0,   'signal_exit': False},
-    'sl_2pct':        {'type': 'stop_loss',      'sl_pct': 2.0,  'tp_pct': 0,    'trail_pct': 0,   'signal_exit': False},
-    'sl_3pct':        {'type': 'stop_loss',      'sl_pct': 3.0,  'tp_pct': 0,    'trail_pct': 0,   'signal_exit': False},
-    'tp_3pct':        {'type': 'take_profit',    'sl_pct': 0,    'tp_pct': 3.0,  'trail_pct': 0,   'signal_exit': False},
-    'tp_5pct':        {'type': 'take_profit',    'sl_pct': 0,    'tp_pct': 5.0,  'trail_pct': 0,   'signal_exit': False},
-    'sl_tp':          {'type': 'sl_tp',          'sl_pct': 2.0,  'tp_pct': 3.0,  'trail_pct': 0,   'signal_exit': False},
-    'signal_reversal':{'type': 'signal_reversal','sl_pct': 0,    'tp_pct': 0,    'trail_pct': 0,   'signal_exit': True},
-    'trailing_1pct':  {'type': 'trailing_stop',  'sl_pct': 0,    'tp_pct': 0,    'trail_pct': 1.0, 'signal_exit': False},
-    'trailing_2pct':  {'type': 'trailing_stop',  'sl_pct': 0,    'tp_pct': 0,    'trail_pct': 2.0, 'signal_exit': False},
+    'baseline':       {'type': 'baseline',       'sl_pct': 0,    'tp_pct': 0,    'trail_pct': 0,   'signal_exit': False,
+                       'trail_activation_pct': 0, 'sl_activation_bar': 0},
+    'sl_2pct':        {'type': 'stop_loss',      'sl_pct': 2.0,  'tp_pct': 0,    'trail_pct': 0,   'signal_exit': False,
+                       'trail_activation_pct': 0, 'sl_activation_bar': 0},
+    'sl_3pct':        {'type': 'stop_loss',      'sl_pct': 3.0,  'tp_pct': 0,    'trail_pct': 0,   'signal_exit': False,
+                       'trail_activation_pct': 0, 'sl_activation_bar': 0},
+    'tp_3pct':        {'type': 'take_profit',    'sl_pct': 0,    'tp_pct': 3.0,  'trail_pct': 0,   'signal_exit': False,
+                       'trail_activation_pct': 0, 'sl_activation_bar': 0},
+    'tp_5pct':        {'type': 'take_profit',    'sl_pct': 0,    'tp_pct': 5.0,  'trail_pct': 0,   'signal_exit': False,
+                       'trail_activation_pct': 0, 'sl_activation_bar': 0},
+    'sl_tp':          {'type': 'sl_tp',          'sl_pct': 2.0,  'tp_pct': 3.0,  'trail_pct': 0,   'signal_exit': False,
+                       'trail_activation_pct': 0, 'sl_activation_bar': 0},
+    'signal_reversal':{'type': 'signal_reversal','sl_pct': 0,    'tp_pct': 0,    'trail_pct': 0,   'signal_exit': True,
+                       'trail_activation_pct': 0, 'sl_activation_bar': 0},
+    'trailing_1pct':  {'type': 'trailing_stop',  'sl_pct': 0,    'tp_pct': 0,    'trail_pct': 1.0, 'signal_exit': False,
+                       'trail_activation_pct': 0, 'sl_activation_bar': 0},
+    'trailing_2pct':  {'type': 'trailing_stop',  'sl_pct': 0,    'tp_pct': 0,    'trail_pct': 2.0, 'signal_exit': False,
+                       'trail_activation_pct': 0, 'sl_activation_bar': 0},
+
+    # ── HYBRID / DYNAMIC STRATEGIES ──────────────────────────────────
+    # 1. Trailing 2% but only activates AFTER reaching 2% profit peak
+    'trail_activated':    {'type': 'hybrid_trail', 'sl_pct': 0,    'tp_pct': 0,  'trail_pct': 2.0, 'signal_exit': False,
+                           'trail_activation_pct': 2.0, 'sl_activation_bar': 0},
+
+    # 2. Stop loss 3% but only activates AFTER bar 3 (give position room to breathe)
+    'hybrid_sl':          {'type': 'hybrid_sl',    'sl_pct': 3.0,  'tp_pct': 0,  'trail_pct': 0,   'signal_exit': False,
+                           'trail_activation_pct': 0,  'sl_activation_bar': 3},
+
+    # 3. Extended hold to 18 bars (ride strong trends longer)
+    'hold_18':            {'type': 'hold_18',      'sl_pct': 0,    'tp_pct': 0,  'trail_pct': 0,   'signal_exit': False,
+                           'trail_activation_pct': 0, 'sl_activation_bar': 0, 'max_hold_bars': 18},
+
+    # 4. FULL hybrid: hold=18, trail 2% (after 2% profit), SL 3% (after bar 3)
+    'hybrid_full':        {'type': 'hybrid_full',  'sl_pct': 3.0,  'tp_pct': 0,  'trail_pct': 2.0, 'signal_exit': False,
+                           'trail_activation_pct': 2.0, 'sl_activation_bar': 3, 'max_hold_bars': 18},
 }
 
 
@@ -63,24 +89,35 @@ def load_models(symbol):
             with open(meta_path) as f:
                 meta = json.load(f)
             for seed in SEEDS:
-                path = MODEL_DIR / f'{symbol}_xgb_ens_{seed}.json'
+                path = MODEL_DIR / f'{symbol}_full_xgb_ens_{seed}.json'
                 if not path.exists():
-                    continue
+                    path = MODEL_DIR / f'{symbol}_xgb_ens_{seed}.json'  # fallback for old naming
+                    if not path.exists():
+                        continue
                 m = xgb.XGBClassifier()
                 m.load_model(str(path))
-                mf = meta.get('model_features', {}).get(str(seed), meta.get('features', []))
+                mf = m.get_booster().feature_names
+                # Fallback: use meta if model has no feature_names (older models)
+                if not mf:
+                    mf = meta.get('model_features', {}).get(str(seed), meta.get('features', []))
                 models.append((str(seed), m, mf))
         else:
             for seed in SEEDS:
                 path = MODEL_DIR / f'{symbol}_{tf}_xgb_ens_{seed}.json'
                 if not path.exists():
-                    continue
+                    # Fallback for old naming: m15→15m, m30→30m, h1→1h
+                    old_map = {'m15': '15m', 'm30': '30m', 'h1': '1h'}
+                    old_tf = old_map.get(tf)
+                    if old_tf:
+                        path = MODEL_DIR / f'{symbol}_{old_tf}_xgb_ens_{seed}.json'
+                    if not path.exists():
+                        continue
                 m = xgb.XGBClassifier()
                 m.load_model(str(path))
                 mf = m.get_booster().feature_names
-                prefix = f'{tf}_'
-                if mf and not mf[0].startswith(prefix):
-                    mf = [f'{prefix}{f}' if not f.startswith(prefix) else f for f in mf]
+                # For per-TF models, ensure features have TF prefix (older models may have bare names)
+                if tf != 'full' and mf and not mf[0].startswith(f'{tf}_'):
+                    mf = [f'{tf}_{f}' if not f.startswith(f'{tf}_') else f for f in mf]
                 models.append((str(seed), m, mf))
         if len(models) >= 2:
             groups[tf] = models
@@ -95,7 +132,7 @@ def compute_proba(symbol, groups, feat_df):
         tf_probs = []
         for seed, m, mf in models:
             available = [c for c in mf if c in feat_df.columns]
-            X = feat_df[available].fillna(0).clip(-10, 10)
+            X = feat_df[available].fillna(0).clip(-10, 10).values  # .values to avoid Arrow dtype / feature name mismatch in XGBoost inplace_predict
             probs = m.predict_proba(X)[:, 1]
             tf_probs.append(probs)
         if tf_probs:
@@ -105,15 +142,21 @@ def compute_proba(symbol, groups, feat_df):
     return np.nanmean(all_probs, axis=0)
 
 
-def run_backtest(symbol, df, threshold, hold_bars, cooldown_bars, exit_config):
+def run_backtest(symbol, df, threshold, hold_bars, cooldown_bars, exit_config,
+                 entry_mask=None, dir_filter=None):
     """Run a single backtest with configurable exit strategy.
 
     df: pre-aligned DataFrame with 'close' and 'proba' columns, already trimmed of warmup.
     exit_config keys:
-      sl_pct:     stop loss % (0 = disabled)
-      tp_pct:     take profit % (0 = disabled)
-      trail_pct:  trailing stop % (0 = disabled)
-      signal_exit: exit when proba crosses back below threshold
+      sl_pct:              stop loss % (0 = disabled)
+      tp_pct:              take profit % (0 = disabled)
+      trail_pct:           trailing stop % (0 = disabled)
+      signal_exit:         exit when proba crosses back below threshold
+      trail_activation_pct: trailing only activates after profit >= this threshold (0 = always active)
+      sl_activation_bar:   stop loss only activates after this many bars (0 = always active)
+      max_hold_bars:       overrides global hold_bars if > 0 (0 = use global hold_bars)
+    entry_mask: optional bool array — False bars skip entry (ATR volatility filter)
+    dir_filter: optional int array — 1 (allow long only), -1 (allow short only), 0 (no restriction)
     """
     prob = df['proba'].values
     n = len(df)
@@ -135,6 +178,11 @@ def run_backtest(symbol, df, threshold, hold_bars, cooldown_bars, exit_config):
     tp_pct = exit_config.get('tp_pct', 0)
     trail_pct = exit_config.get('trail_pct', 0)
     signal_exit = exit_config.get('signal_exit', False)
+    trail_activation_pct = exit_config.get('trail_activation_pct', 0)
+    sl_activation_bar = exit_config.get('sl_activation_bar', 0)
+    max_hold_bars = exit_config.get('max_hold_bars', 0)
+    if max_hold_bars > 0:
+        hold_bars = max_hold_bars
 
     for idx in range(n):
         row = df.iloc[idx]
@@ -149,6 +197,7 @@ def run_backtest(symbol, df, threshold, hold_bars, cooldown_bars, exit_config):
         exit_reason = None
         if position != 0:
             hold_remaining -= 1
+            bars_since_entry = hold_bars - abs(hold_remaining)
             exit_this_bar = False
 
             # 1. Time-based exit
@@ -156,8 +205,8 @@ def run_backtest(symbol, df, threshold, hold_bars, cooldown_bars, exit_config):
                 exit_reason = 'hold_expiry'
                 exit_this_bar = True
 
-            # 2. Stop loss
-            if not exit_this_bar and sl_pct > 0:
+            # 2. Stop loss (only if past sl_activation_bar)
+            if not exit_this_bar and sl_pct > 0 and bars_since_entry >= sl_activation_bar:
                 if position == 1:
                     pnl_pct = (price - entry_price) / entry_price * 100
                 else:
@@ -176,25 +225,35 @@ def run_backtest(symbol, df, threshold, hold_bars, cooldown_bars, exit_config):
                     exit_reason = f'take_profit_{tp_pct}%'
                     exit_this_bar = True
 
-            # 4. Trailing stop
+            # 4. Trailing stop (with optional activation threshold)
             if not exit_this_bar and trail_pct > 0:
-                if position == 1:
-                    peak_price = max(peak_price, price)
-                    trail_pnl = (peak_price - entry_price) / entry_price * 100
-                    # Exit if retraced trail_pct % from peak
-                    if trail_pnl > trail_pct:
-                        retrace = (peak_price - price) / peak_price * 100
-                        if retrace >= trail_pct:
-                            exit_reason = f'trailing_{trail_pct}%'
-                            exit_this_bar = True
-                else:
-                    peak_price = min(peak_price, price)
-                    trail_pnl = (entry_price - peak_price) / entry_price * 100
-                    if trail_pnl > trail_pct:
-                        retrace = (price - peak_price) / peak_price * 100
-                        if retrace >= trail_pct:
-                            exit_reason = f'trailing_{trail_pct}%'
-                            exit_this_bar = True
+                trail_engaged = True
+                if trail_activation_pct > 0:
+                    # Only engage trail after peak profit >= activation threshold
+                    if position == 1:
+                        peak_profit_pct = (peak_price - entry_price) / entry_price * 100
+                    else:
+                        peak_profit_pct = (entry_price - peak_price) / entry_price * 100
+                    trail_engaged = peak_profit_pct >= trail_activation_pct
+
+                if trail_engaged:
+                    if position == 1:
+                        peak_price = max(peak_price, price)
+                        trail_pnl = (peak_price - entry_price) / entry_price * 100
+                        # Exit if retraced trail_pct % from peak
+                        if trail_pnl > trail_pct:
+                            retrace = (peak_price - price) / peak_price * 100
+                            if retrace >= trail_pct:
+                                exit_reason = f'trailing_{trail_pct}%'
+                                exit_this_bar = True
+                    else:
+                        peak_price = min(peak_price, price)
+                        trail_pnl = (entry_price - peak_price) / entry_price * 100
+                        if trail_pnl > trail_pct:
+                            retrace = (price - peak_price) / peak_price * 100
+                            if retrace >= trail_pct:
+                                exit_reason = f'trailing_{trail_pct}%'
+                                exit_this_bar = True
 
             # 5. Signal reversal exit
             if not exit_this_bar and signal_exit:
@@ -249,6 +308,17 @@ def run_backtest(symbol, df, threshold, hold_bars, cooldown_bars, exit_config):
             elif prob_val <= (1 - threshold):
                 direction = -1  # short
                 entry_price = price * (1 - SLIPPAGE)
+
+            # Apply regime/volatility filters
+            if direction != 0:
+                # ATR volatility filter: skip if entry_mask[idx] is False
+                if entry_mask is not None and not entry_mask[idx]:
+                    direction = 0
+                # Trend filter: skip if dir_filter conflicts with direction
+                if direction != 0 and dir_filter is not None and dir_filter[idx] != 0:
+                    if (direction == 1 and dir_filter[idx] == -1) or \
+                       (direction == -1 and dir_filter[idx] == 1):
+                        direction = 0
 
             if direction != 0:
                 position_pct = 0.15
@@ -323,32 +393,47 @@ def run_backtest(symbol, df, threshold, hold_bars, cooldown_bars, exit_config):
     }
 
 
-def run_all_strategies(symbol, threshold=0.60, hold_bars=9, cooldown_bars=3, days_data=130, warmup_bars=200):
-    """Run all exit strategies on one symbol."""
+def run_all_strategies(symbol, threshold=0.60, hold_bars=9, cooldown_bars=3,
+                       days_data=130, warmup_bars=200,
+                       use_atr_filter=False, use_trend_filter=False,
+                       filter_name="", feat_df=None):
+    """Run all exit strategies on one symbol.
+    
+    use_atr_filter:   bool — apply ATR volatility filter (skip high volatility entries)
+    use_trend_filter: bool — apply H1 SMA(50) trend filter (long when bull, short when bear)
+    filter_name:      str  — label for the filter being tested (for output)
+    feat_df:          pd.DataFrame or None — pre-loaded feature DataFrame (skips parquet load)
+    """
     print(f"\n{'='*60}")
     print(f"  {symbol}")
     print(f"{'='*60}")
     print(f"  Loading data...", end=' ')
 
     # Fetch OHLCV
-    from ml_voting_backtest import fetch_5m_ohlcv
+    try:
+        from ml_voting_backtest import fetch_5m_ohlcv
+    except ModuleNotFoundError:
+        from src.backtesting.ml_voting_backtest import fetch_5m_ohlcv
     ohlcv = fetch_5m_ohlcv(symbol, days_data)
     if ohlcv is None or len(ohlcv) < 1000:
         print(f"❌ No OHLCV data")
         return None
     print(f"{len(ohlcv)} bars")
 
-    # Load features
-    tf_suffix = '_'.join(sorted(['15m', '30m', '1h', '4h']))
-    candidates = list(CACHE_DIR.glob(f"{symbol}_5m_*_{tf_suffix}.parquet"))
-    if not candidates:
-        candidates = list(CACHE_DIR.glob(f"{symbol}_5m_*.parquet"))
-    if not candidates:
-        print(f"  ❌ No feature cache")
-        return None
-    cache_path = max(candidates, key=lambda p: p.stat().st_mtime)
-    feat_df = pd.read_parquet(cache_path)
-    print(f"  Features: {len(feat_df)} rows")
+    # Load features (or use pre-loaded)
+    if feat_df is not None:
+        print(f"  Using pre-loaded features: {len(feat_df)} rows")
+    else:
+        tf_suffix = '_'.join(sorted(['15m', '30m', '1h', '4h']))
+        candidates = list(CACHE_DIR.glob(f"{symbol}_5m_*_{tf_suffix}.parquet"))
+        if not candidates:
+            candidates = list(CACHE_DIR.glob(f"{symbol}_5m_*.parquet"))
+        if not candidates:
+            print(f"  ❌ No feature cache")
+            return None
+        cache_path = max(candidates, key=lambda p: p.stat().st_mtime)
+        feat_df = pd.read_parquet(cache_path)
+        print(f"  Features: {len(feat_df)} rows")
 
     # Load models
     groups = load_models(symbol)
@@ -372,12 +457,38 @@ def run_all_strategies(symbol, threshold=0.60, hold_bars=9, cooldown_bars=3, day
     aligned_proba = ohlcv_aligned['proba'].values
     print(f"  Aligned: {len(ohlcv_aligned)} bars")
 
+    # ── Compute regime/volatility filters ─────────────────────────
+    entry_mask = None
+    dir_filter = None
+    if use_atr_filter or use_trend_filter:
+        from src.strategies.regime_filters import make_entry_mask
+        # Merge OHLCV into feat_df for filter computation
+        filter_df = feat_df.copy()
+        for col in ['close', 'high', 'low', 'volume']:
+            if col in ohlcv.columns and col not in filter_df.columns:
+                filter_df[col] = ohlcv[col]
+        entry_mask, dir_filter = make_entry_mask(filter_df,
+                                                  use_atr=use_atr_filter,
+                                                  use_trend=use_trend_filter)
+        # Align filter indices to aligned data
+        aligned_idx = ohlcv_aligned.index
+        feat_idx = feat_df.index
+        idx_map = {ts: i for i, ts in enumerate(feat_idx) if ts in aligned_idx}
+        aligned_mask = np.array([entry_mask[idx_map[ts]] for ts in aligned_idx], dtype=bool)
+        aligned_dir = np.array([dir_filter[idx_map[ts]] for ts in aligned_idx], dtype=int)
+        entry_mask = aligned_mask
+        dir_filter = aligned_dir
+        blocked = int(np.sum(~entry_mask))
+        restrict = int(np.sum(dir_filter != 0))
+        print(f"  Filter: ATR={use_atr_filter} Trend={use_trend_filter} | {blocked} bars blocked ({blocked/len(entry_mask)*100:.1f}%), {restrict} bars direction-restricted")
+
     # Run each strategy
     results = {}
     for name, config in EXIT_STRATEGIES.items():
         print(f"  ▶ {name}...", end=' ')
         t0 = time.time()
-        r = run_backtest(symbol, ohlcv_aligned, threshold, hold_bars, cooldown_bars, config)
+        r = run_backtest(symbol, ohlcv_aligned, threshold, hold_bars, cooldown_bars, config,
+                         entry_mask=entry_mask, dir_filter=dir_filter)
         if r:
             results[name] = r
             exit_counts = ', '.join(f"{k}:{v}" for k, v in sorted(r['exit_reasons'].items()))

@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""
+Cron 1-Hour Orchestrator — runs every hour to:
+  1. Analyze live signal quality decay (WR, PF trend vs backtest baseline)
+  2. Decide action per symbol: RETRAIN / ADJUST (threshold) / SKIP
+  3. Run retrain if needed (max 2 symbols/cycle, staggered)
+  4. Update Kelly sizing from live trades
+  5. Send condensed report to Telegram
+
+Decision Matrix per Symbol (3 possible actions):
+  ┌─────────────────────────────────────────────────────┬────────────────────┐
+  │ Condition                                            │ Action             │
+  ├─────────────────────────────────────────────────────┼────────────────────┤
+  │ WR < 60%  OR  PF < 2.0  OR  signal drop > 20%       │ 🟥 RETRAIN (force) │
+  │ WR 60-68%  OR  PF 2.0-3.0  OR  stable edge          │ 🟡 ADJUST thresh   │
+  │ WR ≥ 70%  AND  PF ≥ 3.0  AND  no trend decay         │ 🟢 SKIP (edge OK)  │
+  └─────────────────────────────────────────────────────┴────────────────────┘
+
+This script is called by Hermes cron system, NOT by the system cron daemon.
+"""
+import sys
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent.parent.parent  # = /root/projects/mimia-quant
+sys.path.insert(0, str(ROOT))
+
+import os
+import json
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+from datetime import datetime, timedelta
+import numpy as np
+
+# ── Config ─────────────────────────────────────────────────────────
+SYMBOLS_10 = ['APTUSDT', 'UNIUSDT', 'FETUSDT', 'TIAUSDT', 'SOLUSDT',
+              'OPUSDT', '1000PEPEUSDT', 'SUIUSDT', 'ARBUSDT', 'INJUSDT']
+
+DB_PATH = Path("data/live_trading.db")
+STATUS_FILE = Path("data/ml_models/_retrain_status.json")
+MODEL_DIR = Path("data/ml_models")
+RETRAIN_SCRIPT = Path("scripts/training/auto_retrain.py")
+OUTPUT_DIR = Path("data/cron_output")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Per-cycle limits
+MAX_RETRAIN_PER_CYCLE = 2     # at most 2 symbols per hour
+RETRAIN_INTERVAL_HOURS = 24   # don't retrain same symbol more than once/day
+FULL_CYCLE_HOURS = 12         # complete full cycle over all symbols in 12 hours
+
+# Signal quality thresholds
+WR_BACKTEST_BASELINE = 0.70   # backtest target WR (70% from SOUL.md)
+PF_BACKTEST_BASELINE = 3.0    # backtest target PF
+WR_FORCE_RETRAIN = 0.60       # if live WR falls below this → force retrain
+PF_FORCE_RETRAIN = 2.0        # if live PF falls below this → force retrain
+DECAY_WARNING_PCT = 0.20      # if live WR falls 20% below backtest avg → force retrain
+MIN_TRADES_FOR_STATS = 30     # minimum trades before quality stats are meaningful
+
+# Import Kelly sizer
+sys.path.insert(0, str(ROOT))
+from src.strategies.kelly_sizer import KellySizer
+
+
+# ── Utility ──────────────────────────────────────────────────────────
+
+def log(msg: str, level: str = "INFO"):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [{level}] {msg}")
+
+
+def get_retrain_status() -> dict:
+    """Load retrain status file."""
+    if STATUS_FILE.exists():
+        with open(STATUS_FILE) as f:
+            return json.load(f)
+    return {'symbols': {}, 'last_run': None, 'runs': []}
+
+
+def get_live_stats_per_symbol(symbol: str) -> dict:
+    """Get live trade stats (WR, PF, n_trades) for one symbol from DB."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*), COALESCE(SUM(CASE WHEN pnl_net > 0 THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN pnl_net > 0 THEN pnl_net ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN pnl_net < 0 THEN ABS(pnl_net) ELSE 0 END), 0)
+            FROM live_trades
+            WHERE symbol = ? AND exit_time IS NOT NULL AND pnl_net IS NOT NULL
+        """, (symbol,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row or row[0] < MIN_TRADES_FOR_STATS:
+            return {'n_trades': row[0] if row else 0, 'wr': 0.0, 'pf': 0.0}
+        n, wins, win_pnl, loss_pnl = row
+        wr = float(wins) / float(n) if n > 0 else 0.0
+        pf = float(win_pnl) / float(loss_pnl) if loss_pnl > 0 else float('inf')
+        return {'n_trades': int(n), 'wr': wr, 'pf': pf}
+    except Exception as e:
+        log(f"get_live_stats({symbol}) failed: {e}", "WARN")
+        return {'n_trades': 0, 'wr': 0.0, 'pf': 0.0}
+
+
+def analyze_signal_quality(symbol: str, status_data: dict) -> dict:
+    """
+    Analyze signal quality for one symbol.
+    Returns dict with action, reason, and stats.
+    """
+    live = get_live_stats_per_symbol(symbol)
+    n_trades = live['n_trades']
+    live_wr = live['wr']
+    live_pf = live['pf']
+
+    # Get last retrain
+    entry = status_data.get(symbol, {})
+    last_retrained = entry.get('last_retrained')
+    bt_wr_raw = entry.get('wr', WR_BACKTEST_BASELINE * 100)
+    bt_pf = entry.get('pf', PF_BACKTEST_BASELINE)
+    # Normalize wr to 0-1 scale (auto_retrain stores 0-100)
+    bt_wr = bt_wr_raw / 100.0 if bt_wr_raw > 1 else bt_wr_raw
+
+    # Build decision context
+    result = {
+        'symbol': symbol,
+        'n_trades': n_trades,
+        'live_wr': live_wr,
+        'live_pf': live_pf,
+        'bt_wr': bt_wr,
+        'bt_pf': bt_pf,
+        'last_retrained': last_retrained,
+    }
+
+    # Not enough trades → time-based schedule only
+    if n_trades < MIN_TRADES_FOR_STATS:
+        if last_retrained:
+            try:
+                last_dt = datetime.fromisoformat(last_retrained)
+                hours_since = (datetime.now() - last_dt).total_seconds() / 3600
+                if hours_since >= RETRAIN_INTERVAL_HOURS:
+                    result['action'] = 'RETRAIN'
+                    result['reason'] = f'insufficient trades ({n_trades}) + {hours_since:.0f}h since last retrain'
+                    result['priority'] = 2
+                else:
+                    result['action'] = 'SKIP'
+                    result['reason'] = f'too few trades ({n_trades}), next retrain in {RETRAIN_INTERVAL_HOURS-hours_since:.0f}h'
+                    result['priority'] = 5
+            except Exception:
+                result['action'] = 'RETRAIN'
+                result['reason'] = 'insufficient trades, no valid last_retrained'
+                result['priority'] = 2
+        else:
+            result['action'] = 'RETRAIN'
+            result['reason'] = 'never retrained'
+            result['priority'] = 1
+        return result
+
+    # Force retrain conditions — signal decay detected
+    if live_wr < WR_FORCE_RETRAIN:
+        result['action'] = 'RETRAIN'
+        result['reason'] = f'WR {live_wr:.0%} < {WR_FORCE_RETRAIN:.0%} threshold'
+        result['priority'] = 1
+        return result
+
+    if live_pf < PF_FORCE_RETRAIN:
+        result['action'] = 'RETRAIN'
+        result['reason'] = f'PF {live_pf:.2f} < {PF_FORCE_RETRAIN:.1f} threshold'
+        result['priority'] = 1
+        return result
+
+    decay_pct = (bt_wr - live_wr) / max(bt_wr, 0.01)
+    if bt_wr > 0.5 and decay_pct > DECAY_WARNING_PCT:
+        result['action'] = 'RETRAIN'
+        result['reason'] = f'signal decay {decay_pct:.0%} > {DECAY_WARNING_PCT:.0%} (BT WR {bt_wr:.0%} → Live {live_wr:.0%})'
+        result['priority'] = 2
+        return result
+
+    # Edge OK — skip if time-based interval not exceeded
+    if live_wr >= WR_BACKTEST_BASELINE and live_pf >= PF_BACKTEST_BASELINE:
+        result['action'] = 'SKIP'
+        result['reason'] = f'edge OK: WR {live_wr:.0%} PF {live_pf:.2f}'
+        result['priority'] = 5
+        return result
+
+    # Acceptable region — keep but schedule
+    if live_wr >= 0.60 and live_pf >= 2.0:
+        if last_retrained:
+            try:
+                last_dt = datetime.fromisoformat(last_retrained)
+                hours_since = (datetime.now() - last_dt).total_seconds() / 3600
+                if hours_since >= RETRAIN_INTERVAL_HOURS:
+                    result['action'] = 'RETRAIN'
+                    result['reason'] = f'time-based: {hours_since:.0f}h since last retrain (WR {live_wr:.0%} PF {live_pf:.2f})'
+                    result['priority'] = 3
+                else:
+                    result['action'] = 'SKIP'
+                    result['reason'] = f'stable edge: WR {live_wr:.0%} PF {live_pf:.2f} (next {RETRAIN_INTERVAL_HOURS-hours_since:.0f}h)'
+                    result['priority'] = 4
+            except Exception:
+                result['action'] = 'RETRAIN'
+                result['reason'] = f'stable edge, last_retrained unparseable'
+                result['priority'] = 3
+        else:
+            result['action'] = 'RETRAIN'
+            result['reason'] = 'never retrained (stable edge)'
+            result['priority'] = 1
+        return result
+
+    # Default: time-based
+    result['action'] = 'SKIP'
+    result['reason'] = 'default (insufficient data)'
+    result['priority'] = 6
+    return result
+
+
+def decide_actions(status: dict) -> list:
+    """
+    Analyze ALL symbols, decide actions, return prioritized list
+    of symbols to retrain (max MAX_RETRAIN_PER_CYCLE).
+    """
+    symbols_data = status.get('symbols', {})
+    decisions = []
+    for sym in SYMBOLS_10:
+        quality = analyze_signal_quality(sym, symbols_data)
+        decisions.append(quality)
+
+    # Log all decisions
+    for d in sorted(decisions, key=lambda x: x['priority']):
+        icon = '🔴' if d['action'] == 'RETRAIN' else '🟢'
+        log(f"{icon} {d['symbol']}: {d['action']} — {d['reason']}")
+
+    # Return symbols to retrain (highest priority first)
+    retrain = [d for d in decisions if d['action'] == 'RETRAIN']
+    retrain.sort(key=lambda x: x['priority'])
+    return retrain[:MAX_RETRAIN_PER_CYCLE]
+
+
+def update_kelly_from_live_db():
+    """Pull trade data from live DB and update Kelly sizing."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(DB_PATH))
+        cursor = conn.cursor()
+        
+        # Check if live_trades table exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='live_trades'")
+        if not cursor.fetchone():
+            log("No live_trades table yet", "WARN")
+            conn.close()
+            return None
+        
+        # Get all closed trades
+        cursor.execute("""
+            SELECT symbol, direction, entry_price, exit_price, entry_time, exit_time, pnl_net
+            FROM live_trades
+            WHERE exit_time IS NOT NULL AND pnl_net IS NOT NULL
+            ORDER BY exit_time DESC
+            LIMIT 500
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        if not rows:
+            log("No closed trades in DB", "INFO")
+            return None
+        
+        # Build per-symbol stats
+        trades_by_symbol = {}
+        for row in rows:
+            sym, direction, entry_p, exit_p, entry_t, exit_t, pnl = row
+            if sym not in trades_by_symbol:
+                trades_by_symbol[sym] = []
+            trades_by_symbol[sym].append({
+                'pnl_net': float(pnl) if pnl else 0,
+                'direction': direction,
+            })
+        
+        # Update Kelly
+        sizer = KellySizer()
+        for sym, trades in trades_by_symbol.items():
+            if len(trades) >= 30:
+                stats = sizer.update_from_trades(sym, trades)
+                log(f"Kelly {sym}: pos={stats.get('position_pct', 0)*100:.1f}% WR={stats.get('win_rate', 0)*100:.0f}% PF={stats.get('profit_factor', 0):.2f}")
+            else:
+                log(f"Kelly {sym}: insufficient trades ({len(trades)} < 30), skipping")
+        
+        return sizer.summary()
+    
+    except Exception as e:
+        log(f"Kelly update failed: {e}", "ERROR")
+        return None
+
+
+def get_live_status() -> str:
+    """Get current live trading status for report."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(DB_PATH))
+        cursor = conn.cursor()
+        
+        # Wallet balance
+        cursor.execute("SELECT capital FROM live_capital ORDER BY timestamp DESC LIMIT 1")
+        row = cursor.fetchone()
+        balance = float(row[0]) if row else 0
+        
+        # Open positions
+        cursor.execute("""
+            SELECT symbol, position, entry_price, qty
+            FROM live_state
+            WHERE position != 0
+        """)
+        open_positions = cursor.fetchall()
+        
+        # Trades today
+        cursor.execute("""
+            SELECT COUNT(*), COALESCE(SUM(pnl_net), 0)
+            FROM live_trades
+            WHERE exit_time IS NOT NULL
+              AND date(exit_time) = date('now')
+        """)
+        today_count, today_pnl = cursor.fetchone()
+        
+        conn.close()
+        
+        parts = [f"💰 **${balance:.2f}**"]
+        if open_positions:
+            pos_strs = []
+            for sym, pos, entry, qty in open_positions:
+                dir_symbol = "🟢"
+                pnl_pct = 0  # no current_price available in DB
+                pos_strs.append(f"{dir_symbol} {sym}")
+            parts.append(f"📊 {' • '.join(pos_strs)}")
+        else:
+            parts.append("📊 No open positions")
+        
+        if today_count:
+            parts.append(f"📈 Today: {today_count} trades | PnL ${float(today_pnl):.2f}")
+        
+        return " | ".join(parts)
+    
+    except Exception as e:
+        return f"DB error: {e}"
+
+
+def generate_report() -> str:
+    """Generate condensed report for Telegram."""
+    lines = []
+    lines.append("📊 **Mimia Hourly Report**")
+    lines.append("")
+    
+    # Live status
+    live = get_live_status()
+    lines.append(live)
+    lines.append("")
+    
+    # Kelly summary
+    try:
+        sizer = KellySizer()
+        kelly_data = sizer.data.get('symbols', {})
+        if kelly_data:
+            lines.append("**📐 Kelly Sizing**")
+            for sym, k in sorted(kelly_data.items()):
+                pp = k.get('position_pct', 0) * 100
+                wr = k.get('win_rate', 0) * 100
+                pf = k.get('profit_factor', 0)
+                nt = k.get('n_trades', 0)
+                if nt >= 30:
+                    lines.append(f"  `{sym:<10}` {pp:.0f}%  WR{wr:.0f}%  PF{pf:.2f}  ({nt} tr)")
+    except Exception as e:
+        lines.append(f"Kelly: {e}")
+    lines.append("")
+    
+    # Signal quality analysis
+    status = get_retrain_status()
+    symbols_data = status.get('symbols', {})
+    lines.append("**🔍 Signal Quality**")
+    lines.append(f"```")
+    lines.append(f"{'SYMBOL':<10} {'LIVE-WR':>7} {'LIVE-PF':>7} {'BT-WR':>6} {'ACTION':<8} {'PRIO':>4}")
+    lines.append(f"{'-'*10} {'-'*7} {'-'*7} {'-'*6} {'-'*8} {'-'*4}")
+    for sym in SYMBOLS_10:
+        quality = analyze_signal_quality(sym, symbols_data)
+        lw = f"{quality['live_wr']:.0%}" if quality['n_trades'] >= MIN_TRADES_FOR_STATS else f"~{quality['live_wr']:.0%}" if quality['n_trades'] > 0 else "N/A"
+        lp = f"{quality['live_pf']:.2f}" if quality['n_trades'] >= MIN_TRADES_FOR_STATS else "N/A"
+        bw = f"{quality['bt_wr']:.0%}"
+        act = quality['action']
+        icon = "🔴" if act == "RETRAIN" else "🟢"
+        prio = quality['priority']
+        lines.append(f"{sym:<10} {lw:>7} {lp:>7} {bw:>6} {icon}{act:<6} {prio:>3}")
+    lines.append(f"```")
+    lines.append("")
+    
+    # Retrain status history
+    if symbols_data:
+        lines.append("**🔄 Retrain History**")
+        for sym in sorted(symbols_data.keys()):
+            s = symbols_data.get(sym, {})
+            last = s.get('last_retrained', 'never')[:16] if s.get('last_retrained') else 'never'
+            wr = s.get('wr', 0)
+            pf = s.get('pf', 0)
+            lines.append(f"  `{sym:<10}` WR{wr:.0f}% PF{pf:.2f} [{last}]")
+    
+    lines.append("")
+    lines.append(f"🤖 _Mimia — {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC_")
+    
+    return '\n'.join(lines)
+
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+def main():
+    log("Hourly cycle starting")
+    t0 = time.time()
+    results = {'decisions': [], 'retrain': [], 'kelly': False, 'report': None}
+    
+    # ── Step 1: Analyze signal quality → decide actions ──────────
+    status = get_retrain_status()
+    decisions = decide_actions(status)
+    results['decisions'] = decisions
+    
+    for d in decisions:
+        sym = d['symbol']
+        log(f"Retraining {sym} (priority {d['priority']}: {d['reason']})...")
+        result = run_retrain(sym)
+        results['retrain'].append({'symbol': sym, 'status': result.get('status'),
+                                    'deployed': result.get('deployed', False)})
+    
+    # ── Step 2: Update Kelly ──────────────────────────────────────
+    kelly_summary = update_kelly_from_live_db()
+    results['kelly'] = kelly_summary is not None
+    
+    # ── Step 3: Generate report ───────────────────────────────────
+    report = generate_report()
+    results['report'] = report
+    print(report)
+    
+    # ── Summary ───────────────────────────────────────────────────
+    elapsed = time.time() - t0
+    n_retrained = len(decisions)
+    log(f"Cycle complete in {elapsed:.0f}s | Retrained: {n_retrained} | Kelly: {results['kelly']}")
+    
+    # Return report for Telegram delivery
+    return report
+
+
+def run_retrain(symbol: str) -> dict:
+    """Run auto_retrain for one symbol and return result."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            [sys.executable, str(RETRAIN_SCRIPT), '--symbol', symbol],
+            capture_output=True, text=True, timeout=600,
+            cwd=str(ROOT),  # = /root/projects/mimia-quant so auto_retrain's data/ paths resolve correctly
+            env={**os.environ, 'PYTHONPATH': str(ROOT)}
+        )
+        if result.returncode == 0:
+            log(f"Retrain {symbol} OK", "INFO")
+            return {'status': 'ok', 'deployed': 'DEPLOYED' in result.stdout}
+        else:
+            log(f"Retrain {symbol} failed: {result.stderr[:200]}", "ERROR")
+            return {'status': 'error', 'error': result.stderr[:200]}
+    except subprocess.TimeoutExpired:
+        log(f"Retrain {symbol} timed out", "ERROR")
+        return {'status': 'timeout'}
+    except Exception as e:
+        log(f"Retrain {symbol} exception: {e}", "ERROR")
+        return {'status': 'exception', 'error': str(e)}
+
+
+if __name__ == '__main__':
+    report = main()
+    if report:
+        # Write report to file for cron to pick up
+        report_path = OUTPUT_DIR / f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(report_path, 'w') as f:
+            f.write(report)
+        print(f"\nReport saved: {report_path}")

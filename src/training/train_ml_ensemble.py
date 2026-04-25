@@ -40,7 +40,13 @@ HPARAMS = {
 
 
 def select_features(X_train, y_train, X_val=None):
-    """Feature selection: remove low-variance + top 80 by mutual info."""
+    """Feature selection: remove low-variance, non-numeric + top 80 by mutual info."""
+    # Filter to numeric columns only (Arrow-backed string columns break var/reduction)
+    numeric_cols = X_train.select_dtypes(include='number').columns.tolist()
+    if X_val is not None:
+        X_val = X_val[numeric_cols]
+    X_train = X_train[numeric_cols]
+
     variances = X_train.var()
     low_var = variances[variances < 1e-8].index.tolist()
     if low_var:
@@ -65,78 +71,72 @@ def select_features(X_train, y_train, X_val=None):
     return X_train, X_val, top_features
 
 
-def train_ensemble_symbol(symbol: str, days: int = 120):
-    """Train 5 XGBoost models with different seeds for a symbol."""
+def train_full_from_features(feat_df: pd.DataFrame, symbol: str) -> dict:
+    """
+    Train 'full' ensemble using pre-computed features (ALL features from all TFs).
+    Saves as {symbol}_full_xgb_ens_{seed}.json — compatible with load_models() fallback.
+
+    This is the core training function used by auto_retrain.py for the 'full' TF group.
+    """
     print(f"\n{'='*60}")
-    print(f"Training ENSEMBLE for {symbol} (5 models)...")
+    print(f"Training FULL ensemble for {symbol} (5 models, all features)...")
     print(f"{'='*60}")
-    
-    X, y, idx = prepare_ml_dataset(
-        symbol, days=days,
-        target_candle=9,  # 9 × 5m = 45 minutes
-        intervals=['15m', '30m', '1h', '4h']
-    )
-    if X is None:
-        print(f"  ❌ No data for {symbol}")
+
+    if 'target' not in feat_df.columns:
+        print(f"  ❌ No 'target' column in pre-computed features")
         return None
-    
-    print(f"  Dataset: {len(X)} samples, {len(X.columns)} features")
-    
-    # Split
-    train_size = int(len(X) * 0.7)
-    val_size = int(len(X) * 0.15)
-    
+
+    # Use all feature columns (exclude target and non-feature columns)
+    exclude_cols = {'target', 'timestamp', 'open', 'high', 'low', 'close', 'volume'}
+    feature_names = [c for c in feat_df.columns if c not in exclude_cols]
+
+    X = feat_df[feature_names]
+    y = feat_df['target']
+
+    print(f"  Dataset: {len(X)} samples, {len(feature_names)} features")
+
+    # Split 70/15/15
+    n = len(X)
+    train_size = int(n * 0.7)
+    val_size = int(n * 0.15)
+
     X_train = X.iloc[:train_size]
     y_train = y.iloc[:train_size]
     X_val = X.iloc[train_size:train_size + val_size]
     y_val = y.iloc[train_size:train_size + val_size]
     X_test = X.iloc[train_size + val_size:]
     y_test = y.iloc[train_size + val_size:]
-    
+
     print(f"  Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
-    
-    # Feature selection (shared across all models in ensemble)
+
+    # Feature selection (MI top 100)
     X_train_fs, X_val_fs, selected_features = select_features(X_train, y_train, X_val)
     X_test_fs = X_test[selected_features]
-    
+
     for df_ in [X_train_fs, X_val_fs, X_test_fs]:
         df_.fillna(0, inplace=True)
         df_.clip(-10, 10, inplace=True)
-    
+
     models = []
     all_metrics = {}
-    
+
     for seed in SEEDS:
         hp = HPARAMS[seed]
-        
-        # Use different feature subsets per model (Random Forest-like diversity)
+
+        # Feature diversity per seed
         np.random.seed(seed)
         n_features = len(selected_features)
         if n_features > 60:
-            # Each model gets a random subset of features
             feat_mask = np.random.choice([True, False], size=n_features, p=[0.75, 0.25])
             model_features = [f for f, m in zip(selected_features, feat_mask) if m]
         else:
             model_features = selected_features
-        
-        # Re-balance by undersampling majority class during training
-        pos_mask = (y_train == 1).values
-        neg_mask = (y_train == 0).values
-        
-        X_train_pos = X_train_fs.loc[y_train[y_train == 1].index]
-        X_train_neg = X_train_fs.loc[y_train[y_train == 0].index]
-        
-        # Undersample majority class
-        np.random.seed(seed)
-        n_pos = pos_mask.sum()
-        n_neg = neg_mask.sum()
-        
-        if n_pos < n_neg:
-            # Balance by weighting instead of sampling
-            scale_pos = n_neg / max(n_pos, 1)
-        else:
-            scale_pos = 1.0
-        
+
+        # Class balance
+        n_pos = (y_train == 1).sum()
+        n_neg = (y_train == 0).sum()
+        scale_pos = n_neg / max(n_pos, 1) if n_pos < n_neg else 1.0
+
         params = {
             'n_estimators': 400,
             'max_depth': hp['max_depth'],
@@ -153,41 +153,39 @@ def train_ensemble_symbol(symbol: str, days: int = 120):
             'random_state': seed,
             'verbosity': 0,
         }
-        
-        # Use only model_features if subsetting
+
         X_train_m = X_train_fs[model_features] if len(model_features) < len(selected_features) else X_train_fs
         X_val_m = X_val_fs[model_features] if len(model_features) < len(selected_features) else X_val_fs
-        
+
         model = xgb.XGBClassifier(**params)
         model.fit(X_train_m, y_train.loc[X_train_m.index],
                   eval_set=[(X_val_m, y_val.loc[X_val_m.index])],
                   verbose=False)
-        
-        # Evaluate on test set
+
+        # Evaluate
         X_test_m = X_test_fs[model_features] if len(model_features) < len(selected_features) else X_test_fs
         y_prob = model.predict_proba(X_test_m)[:, 1]
         y_pred = (y_prob >= 0.55).astype(int)
-        
+
         acc = accuracy_score(y_test, y_pred)
         prec = precision_score(y_test, y_pred, zero_division=0)
         rec = recall_score(y_test, y_pred, zero_division=0)
-        f1 = f1_score(y_test, y_pred, zero_division=0)
+        f1_v = f1_score(y_test, y_pred, zero_division=0)
         auc = roc_auc_score(y_test, y_prob)
-        
-        print(f"    Model {seed}: Acc={acc:.3f} Prec={prec:.3f} Rec={rec:.3f} F1={f1:.3f} AUC={auc:.3f} (features={len(model_features)})")
-        all_metrics[seed] = {'accuracy': float(acc), 'precision': float(prec), 'recall': float(rec), 'f1': float(f1), 'auc': float(auc)}
-        
+
+        print(f"    Model {seed}: Acc={acc:.3f} Prec={prec:.3f} Rec={rec:.3f} F1={f1_v:.3f} AUC={auc:.3f} (features={len(model_features)})")
+        all_metrics[seed] = {'accuracy': float(acc), 'precision': float(prec), 'recall': float(rec), 'f1': float(f1_v), 'auc': float(auc)}
         models.append((str(seed), model, model_features))
-    
-    # Evaluate ensemble (average probability)
+
+    # Ensemble evaluation
     all_probs = []
     for seed, model, mf in models:
         X_test_m = X_test_fs[mf]
         probs = model.predict_proba(X_test_m)[:, 1]
         all_probs.append(probs)
-    
+
     avg_probs = np.mean(all_probs, axis=0)
-    
+
     for thresh in [0.50, 0.55, 0.60, 0.65]:
         ensemble_pred = (avg_probs >= thresh).astype(int)
         ens_acc = accuracy_score(y_test, ensemble_pred)
@@ -195,8 +193,8 @@ def train_ensemble_symbol(symbol: str, days: int = 120):
         ens_rec = recall_score(y_test, ensemble_pred, zero_division=0)
         ens_auc = roc_auc_score(y_test, avg_probs)
         print(f"    ENSEMBLE @{thresh:.2f}: Acc={ens_acc:.3f} Prec={ens_prec:.3f} Rec={ens_rec:.3f} AUC={ens_auc:.3f}")
-    
-    # Find best threshold by maximizing F1
+
+    # Best threshold by F1
     best_f1 = 0
     best_thresh = 0.55
     for thresh in np.arange(0.40, 0.80, 0.01):
@@ -205,24 +203,24 @@ def train_ensemble_symbol(symbol: str, days: int = 120):
         if f1_val > best_f1:
             best_f1 = f1_val
             best_thresh = thresh
-    
+
     print(f"    Best threshold: {best_thresh:.2f} (F1={best_f1:.3f})")
-    
-    # Save all models
+
+    # Save models with 'full' prefix (compatible with load_models)
     model_paths = {}
     for seed, model, mf in models:
-        path = MODEL_DIR / f"{symbol}_xgb_ens_{seed}.json"
+        path = MODEL_DIR / f"{symbol}_full_xgb_ens_{seed}.json"
         model.save_model(str(path))
         model_paths[str(seed)] = str(path)
-    
-    # Save ensemble metadata
+
+    # Save meta with same name as original (load_models looks for this)
     meta = {
         'symbol': symbol,
         'ensemble_size': len(SEEDS),
         'seeds': SEEDS,
         'model_paths': model_paths,
-        'features': selected_features,  # Full feature set
-        'model_features': {str(s): mf for s, _, mf in zip(SEEDS, models, [m[2] for m in models])},
+        'features': selected_features,
+        'model_features': {str(s): mf for s, mf in zip(SEEDS, [m[2] for m in models])},
         'individual_metrics': all_metrics,
         'ensemble_metrics': {
             'best_threshold': float(best_thresh),
@@ -232,13 +230,33 @@ def train_ensemble_symbol(symbol: str, days: int = 120):
         },
         'training_date': datetime.now().isoformat(),
     }
-    
+
     meta_path = MODEL_DIR / f"{symbol}_ensemble_meta.json"
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2, default=lambda x: float(x) if isinstance(x, (np.floating, np.integer)) else str(x))
-    
-    print(f"\n  ✅ Ensemble saved: {len(SEEDS)} models + metadata")
+
+    print(f"\n  ✅ FULL ensemble saved: {len(SEEDS)} models + metadata")
+    print(f"    Best thr={best_thresh:.2f}, AUC={meta['ensemble_metrics']['test_auc']:.3f}")
     return meta
+
+
+# ─── Refactor original train_ensemble_symbol to reuse new function ───
+
+def train_ensemble_symbol(symbol: str, days: int = 120):
+    """Original API — fetches data via prepare_ml_dataset, then delegates to train_full_from_features."""
+    X, y, idx = prepare_ml_dataset(
+        symbol, days=days,
+        target_candle=9,
+        intervals=['15m', '30m', '1h', '4h']
+    )
+    if X is None:
+        print(f"  ❌ No data for {symbol}")
+        return None
+
+    # Combine X & y back into a DataFrame for train_full_from_features
+    feat_df = X.copy()
+    feat_df['target'] = y
+    return train_full_from_features(feat_df, symbol)
 
 
 def main():
