@@ -211,10 +211,14 @@ def compute_technical_features(df: pd.DataFrame, prefix: str = "", drop_raw: boo
 def compute_5m_features_5tf(
     df_5m: pd.DataFrame,
     target_candle: int = 9,
-    intervals: Optional[List[str]] = None
+    intervals: Optional[List[str]] = None,
+    for_inference: bool = False
 ) -> pd.DataFrame:
     """
-    Core feature computation: fetch 5m → resample → compute on ALL TFs → combine.
+    Core feature computation: 5m → resample → compute on ALL TFs → combine.
+    
+    When for_inference=True: skips target column, keeps the most recent rows
+    (normally dropped because target requires N-bar forward lookahead).
     
     5 timeframes used: 5m, 15m, 30m, 1h, 4h
     Target: whether close rises in `target_candle` 5m-bars ahead.
@@ -330,12 +334,17 @@ def compute_5m_features_5tf(
     combined = pd.concat([combined, xtf], axis=1)
     
     # ── Target: 9 5m-candles ahead (= 45 minutes) ──
-    combined['target'] = (close_5m.shift(-target_candle) > close_5m).astype(float)
+    if not for_inference:
+        combined['target'] = (close_5m.shift(-target_candle) > close_5m).astype(float)
     
     # ── Drop NaN rows (need ~200 bars for warmup due to 5m lookback) ──
-    combined = combined.iloc[200:-target_candle].copy()
-    
-    print(f"    Total features: {len([c for c in combined.columns if c != 'target'])} + target")
+    if for_inference:
+        # Keep ALL rows including the most recent ones (no forward-looking target needed)
+        combined = combined.iloc[200:].copy()
+        print(f"    Total features (inference): {len(combined.columns)}")
+    else:
+        combined = combined.iloc[200:-target_candle].copy()
+        print(f"    Total features: {len([c for c in combined.columns if c != 'target'])} + target")
     print(f"    Rows: {len(combined)}")
     
     return combined

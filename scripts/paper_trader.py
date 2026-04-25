@@ -303,20 +303,22 @@ class SignalGenerator:
         return df[['open', 'high', 'low', 'close', 'volume']]
 
     def _load_models(self, symbol: str):
-        """Load all models for a symbol. Cache results."""
-        if symbol in self._cache:
-            return self._cache[symbol]
-
-        tf_suffix = '_'.join(sorted(['15m', '30m', '1h', '4h']))
-        cache_candidates = list(CACHE_DIR.glob(f"{symbol}_5m_*_{tf_suffix}.parquet"))
-        if not cache_candidates:
-            cache_candidates = list(CACHE_DIR.glob(f"{symbol}_5m_*.parquet"))
-        if not cache_candidates:
+        """Load all models for a symbol. Cache models permanently; compute fresh features from live data."""
+        if symbol in self._cache and 'groups' in self._cache[symbol]:
+            # Models are cached — but features are stale (parquet), so we always recompute
+            cached = self._cache[symbol]
+            # Recompute fresh features
+            fresh_features = self._compute_fresh_features(symbol)
+            if fresh_features is not None:
+                cached['features'] = fresh_features
+                return cached
+            # Fallback: try stale cache if fresh fails
+            if 'features' in cached:
+                print(f"    ⚠️ Fresh features failed, using stale for {symbol}")
+                return cached
             return None
-        cache_path = max(cache_candidates, key=lambda p: p.stat().st_mtime)
 
-        feat_df = pd.read_parquet(cache_path)
-
+        # First load: compute fresh features + load models
         group_models = {}
         for tf in TF_GROUPS:
             models = self._load_tf_group(symbol, tf)
@@ -326,12 +328,56 @@ class SignalGenerator:
         if len(group_models) < 2:
             return None
 
+        fresh_features = self._compute_fresh_features(symbol)
+        if fresh_features is None:
+            return None
+
         result = {
-            'features': feat_df,
+            'features': fresh_features,
             'groups': group_models,
         }
         self._cache[symbol] = result
         return result
+
+    def _compute_fresh_features(self, symbol: str) -> Optional[pd.DataFrame]:
+        """Fetch live 5m data and compute all features for inference."""
+        from src.strategies.ml_features import compute_5m_features_5tf
+
+        # Map 1000x symbols to spot symbols for OHLCV (Binance Spot API)
+        spot_symbol = symbol
+        if symbol.startswith("1000"):
+            for prefix in ["1000", "10000", "100000"]:
+                if symbol.startswith(prefix):
+                    spot_symbol = symbol[len(prefix):]
+                    break
+
+        from datetime import datetime, timedelta
+
+        try:
+            print(f"    📡 Fetching live 5m data for {symbol} (Spot: {spot_symbol})...")
+            df_5m = self._fetch_5m_ohlcv(spot_symbol, days=5)
+            if df_5m is None or len(df_5m) < 500:
+                print(f"    ⚠️ Insufficient data for {symbol} (got {len(df_5m) if df_5m is not None else 0} rows)")
+                return None
+
+            print(f"    🔧 Computing features...")
+            feat_df = compute_5m_features_5tf(df_5m, for_inference=True)
+
+            if len(feat_df) == 0:
+                print(f"    ⚠️ No feature rows for {symbol}")
+                return None
+
+            # Print latest timestamp for debugging
+            latest = feat_df.index[-1]
+            print(f"    ✅ {len(feat_df)} feature rows | Latest: {latest} | {len(feat_df.columns)} features")
+
+            return feat_df
+
+        except Exception as e:
+            print(f"    ⚠️ Feature computation error for {symbol}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def _load_tf_group(self, symbol: str, tf_group: str) -> Optional[List]:
         """Load models for one TF group."""
@@ -603,7 +649,7 @@ class PaperTrader:
                         capital, peak_capital, trade_line = exit_result
                         trade_report_lines.append(trade_line)
                         trades_closed += 1
-                        print(f"    ✅ EXIT at exit_time")
+                        print(f"    ✅ EXIT {symbol} — {trade_line}")
 
             # Generate signal if no position and not in cooldown
             if state['position'] == 0 and state['cooldown_remaining'] <= 0:
