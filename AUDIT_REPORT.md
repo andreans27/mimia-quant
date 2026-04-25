@@ -12,11 +12,11 @@
 
 | File | Size | Reason |
 |------|------|--------|
-| `scripts/live_trader.py` | 1,200 lines | Active trading engine |
-| `scripts/live_trader_daemon.sh` | 2,552 chars | Active daemon script |
-| `scripts/run_bot.py` | — | Referenced in Makefile (`make run`) |
-| `scripts/run_backtest.py` | — | Referenced in Makefile (`make backtest`) |
-| `scripts/init_db.py` | — | Referenced in Makefile (`make init-db`) |
+| `scripts/trading/live_trader.py` | 1,200 lines | Active trading engine |
+| `scripts/trading/live_trader_daemon.sh` | 2,552 chars | Active daemon script |
+| `scripts/trading/run_bot.py` | — | Referenced in Makefile (`make run`) |
+| `scripts/backtesting/run_backtest.py` | — | Referenced in Makefile (`make backtest`) |
+| `scripts/trading/init_db.py` | — | Referenced in Makefile (`make init-db`) |
 | `scripts/oos_validation.py` | — | Has compiled .pyc in `__pycache__` |
 | `src/` (all 7 subpackages) | ~290KB total | Core library: `core/`, `strategies/`, `execution/`, `monitoring/`, `utils/` |
 | `config/config.yaml` | 1,319 chars | Main system configuration |

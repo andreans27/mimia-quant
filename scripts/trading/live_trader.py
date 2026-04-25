@@ -6,10 +6,10 @@ Live trading on Binance Futures (testnet or mainnet) using the multi-TF XGBoost 
 Simulates trading with 10 pairs, logs everything to SQLite, reports via Telegram.
 
 Usage:
-    python scripts/live_trader.py                      # Run once (for cron, every 5min)
-    python scripts/live_trader.py --init               # Initialize DB + state
-    python scripts/live_trader.py --status             # Show current state
-    python scripts/live_trader.py --report             # Generate & send daily report
+    python scripts/trading/live_trader.py                # Run once (for cron, every 5min)
+    python scripts/trading/live_trader.py --init          # Initialize DB + state
+    python scripts/trading/live_trader.py --status        # Show current state
+    python scripts/trading/live_trader.py --report        # Generate & send daily report
 """
 
 import sys

@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.threshold_scan import scan_symbol, best_threshold
+from scripts.backtesting.threshold_scan import scan_symbol, best_threshold
 import json, numpy as np
 
 SYMBOLS = [

@@ -35,8 +35,8 @@ for sym in MISSING:
         r = subprocess.run(
             ["python", "-c", f"""
 import sys; sys.path.insert(0, '{ROOT}')
-from scripts.train_ml_ensemble import train_ensemble_symbol
-meta = train_ensemble_symbol('{sym}')
+from scripts.training.train_ml_ensemble import train_ensemble_symbol
+from scripts.training.train_tf_specific import train_tf_specific
 print('DONE' if meta else 'FAILED')
 """],
             cwd=str(ROOT), capture_output=True, text=True, timeout=600
@@ -53,7 +53,7 @@ print('DONE' if meta else 'FAILED')
             r = subprocess.run(
                 ["python", "-c", f"""
 import sys; sys.path.insert(0, '{ROOT}')
-from scripts.train_tf_specific import train_tf_specific, load_cached_features, get_tf_features, select_features
+from scripts.training.train_tf_specific import train_tf_specific, load_cached_features, get_tf_features, select_features
 import numpy as np; import pandas as pd; import json; import xgboost as xgb
 from sklearn.metrics import roc_auc_score, f1_score
 from pathlib import Path
