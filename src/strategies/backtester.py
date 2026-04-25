@@ -72,6 +72,16 @@ class BacktestConfig:
     commission_rate: float = 0.001  # 0.1% per trade
     slippage_rate: float = 0.0005  # 0.05% slippage
     max_position_size: float = 0.2  # 20% max position
+    stop_loss_pct: float = 0.01    # 1% default stop loss
+    take_profit_pct: float = 0.02   # 2% default take-profit target
+    trailing_stop_pct: float = 0.0  # 0 = disabled
+    strategy_risk_overrides: dict = field(default_factory=lambda: {
+        "mean_reversion": {"stop_loss_pct": 0.005, "take_profit_pct": 0.01},
+        "grid": {"stop_loss_pct": 0.005, "take_profit_pct": 0.01},
+        "momentum": {"stop_loss_pct": 0.015, "take_profit_pct": 0.0, "trailing_stop_pct": 0.01},
+        "breakout": {"stop_loss_pct": 0.015, "take_profit_pct": 0.0, "trailing_stop_pct": 0.01},
+        "multi_timeframe": {"stop_loss_pct": 0.02, "take_profit_pct": 0.0, "trailing_stop_pct": 0.015},
+    })
     enable_short_selling: bool = True
     enable_fractional_shares: bool = True
     risk_free_rate: float = 0.02  # 2% annual
@@ -289,31 +299,10 @@ class Backtester:
         if quantity <= 0:
             return
         
-        # Calculate costs
-        commission = quantity * current_price * self.config.commission_rate
-        slippage = quantity * current_price * self.config.slippage_rate
-        total_cost = commission + slippage
-        
-        # Check if we can afford it
-        if signal.side == OrderSide.BUY:
-            required = quantity * current_price + total_cost
-            if required > self.current_capital:
-                quantity = (self.current_capital - total_cost) / current_price
-                quantity = max(0, quantity)
-                if not self.config.enable_fractional_shares:
-                    quantity = int(quantity)
-        
-        if quantity <= 0:
-            return
-        
-        # Update capital for purchase
-        if signal.side == OrderSide.BUY:
-            cost = quantity * current_price + total_cost
-            self.current_capital -= cost
-        else:
-            # For sells, we receive money
-            revenue = quantity * current_price - total_cost
-            self.current_capital += revenue
+        # Deduct entry fees only (futures/perps accounting - no principal exchanged)
+        # PnL is realized only on position close
+        entry_fees = quantity * current_price * (self.config.commission_rate + self.config.slippage_rate)
+        self.current_capital -= entry_fees
         
         # Create or update position
         self._update_position_from_signal(signal, quantity, current_price)
@@ -340,14 +329,13 @@ class Backtester:
             elif existing and existing.side == PositionSide.SHORT:
                 # Cover short position
                 if quantity >= existing.quantity:
-                    # Fully cover
-                    pnl = (existing.entry_price - price) * existing.quantity
-                    self.current_capital += pnl
+                    # Fully cover (capital credited in _close_position)
                     self._close_position(symbol, signal.strategy_name, price)
                 else:
                     # Partially cover
                     pnl = (existing.entry_price - price) * quantity
-                    self.current_capital += pnl
+                    fees = quantity * price * (self.config.commission_rate + self.config.slippage_rate)
+                    self.current_capital += pnl - fees
                     existing.quantity -= quantity
                     existing.current_price = price
             else:
@@ -358,6 +346,8 @@ class Backtester:
                     quantity=quantity,
                     entry_price=price,
                     current_price=price,
+                    highest_price=price,
+                    lowest_price=price,
                     opened_at=self._current_time,
                     strategy_name=signal.strategy_name,
                 )
@@ -375,14 +365,13 @@ class Backtester:
             elif existing and existing.side == PositionSide.LONG:
                 # Take profit or stop loss
                 if quantity >= existing.quantity:
-                    # Fully close
-                    pnl = (price - existing.entry_price) * existing.quantity
-                    self.current_capital += pnl
+                    # Fully close (capital credited in _close_position)
                     self._close_position(symbol, signal.strategy_name, price)
                 else:
                     # Partially close
                     pnl = (price - existing.entry_price) * quantity
-                    self.current_capital += pnl
+                    fees = quantity * price * (self.config.commission_rate + self.config.slippage_rate)
+                    self.current_capital += pnl - fees
                     existing.quantity -= quantity
                     existing.current_price = price
             else:
@@ -394,6 +383,8 @@ class Backtester:
                         quantity=quantity,
                         entry_price=price,
                         current_price=price,
+                        highest_price=price,
+                        lowest_price=price,
                         opened_at=self._current_time,
                         strategy_name=signal.strategy_name,
                     )
@@ -406,13 +397,18 @@ class Backtester:
         if position is None:
             return
         
-        # Record trade
+        # Calculate PnL
         pnl = 0.0
         if position.side == PositionSide.LONG:
             pnl = (exit_price - position.entry_price) * position.quantity
         elif position.side == PositionSide.SHORT:
             pnl = (position.entry_price - exit_price) * position.quantity
         
+        # Add PnL to capital and deduct exit fees
+        fees = position.quantity * exit_price * (self.config.commission_rate + self.config.slippage_rate)
+        self.current_capital += pnl - fees
+        
+        # Record trade
         trade = BacktestTrade(
             entry_time=position.opened_at,
             exit_time=self._current_time,
@@ -431,34 +427,82 @@ class Backtester:
         self.completed_trades.append(trade)
     
     def _update_positions(self) -> None:
-        """Update position prices and check for stop losses."""
+        """Update position prices and check for stop losses, take-profit, and trailing stops."""
         for symbol, position in list(self.positions.items()):
             if symbol in self._current_prices:
-                position.current_price = self._current_prices[symbol]
+                current_price = self._current_prices[symbol]
+                position.current_price = current_price
                 position.updated_at = self._current_time
                 
-                # Check if position should be closed (simple stop loss)
-                stop_loss_pct = self.config.max_position_size * 0.5  # 50% of max position as stop
-                
+                # Track highest/lowest prices since entry
                 if position.side == PositionSide.LONG:
-                    loss_pct = (position.entry_price - position.current_price) / position.entry_price
-                    if loss_pct >= stop_loss_pct:
-                        self._close_position(symbol, position.strategy_name, position.current_price)
-                
+                    if current_price > position.highest_price:
+                        position.highest_price = current_price
                 elif position.side == PositionSide.SHORT:
-                    loss_pct = (position.current_price - position.entry_price) / position.entry_price
-                    if loss_pct >= stop_loss_pct:
-                        self._close_position(symbol, position.strategy_name, position.current_price)
+                    if current_price < position.lowest_price:
+                        position.lowest_price = current_price
+                
+                # --- GET PER-STRATEGY RISK PARAMS ---
+                strategy_overrides = self.config.strategy_risk_overrides.get(position.strategy_name, {})
+                sl_pct = strategy_overrides.get("stop_loss_pct", self.config.stop_loss_pct)
+                tp_pct = strategy_overrides.get("take_profit_pct", self.config.take_profit_pct)
+                ts_pct = strategy_overrides.get("trailing_stop_pct", self.config.trailing_stop_pct)
+                
+                # --- EXIT CHECKS ---
+                
+                # 1. Fixed stop loss
+                if sl_pct > 0:
+                    if position.side == PositionSide.LONG:
+                        loss_pct = (position.entry_price - current_price) / position.entry_price
+                        if loss_pct >= sl_pct:
+                            self._close_position(symbol, position.strategy_name, current_price)
+                            continue
+                    elif position.side == PositionSide.SHORT:
+                        loss_pct = (current_price - position.entry_price) / position.entry_price
+                        if loss_pct >= sl_pct:
+                            self._close_position(symbol, position.strategy_name, current_price)
+                            continue
+                
+                # 2. Take-profit
+                if tp_pct > 0:
+                    if position.side == PositionSide.LONG:
+                        profit_pct = (current_price - position.entry_price) / position.entry_price
+                        if profit_pct >= tp_pct:
+                            self._close_position(symbol, position.strategy_name, current_price)
+                            continue
+                    elif position.side == PositionSide.SHORT:
+                        profit_pct = (position.entry_price - current_price) / position.entry_price
+                        if profit_pct >= tp_pct:
+                            self._close_position(symbol, position.strategy_name, current_price)
+                            continue
+                
+                # 3. Trailing stop
+                if ts_pct > 0:
+                    if position.side == PositionSide.LONG:
+                        if position.highest_price > position.entry_price:
+                            pullback = (position.highest_price - current_price) / position.highest_price
+                            if pullback >= ts_pct:
+                                self._close_position(symbol, position.strategy_name, current_price)
+                                continue
+                    elif position.side == PositionSide.SHORT:
+                        if position.lowest_price < position.entry_price:
+                            pullback = (current_price - position.lowest_price) / position.lowest_price
+                            if pullback >= ts_pct:
+                                self._close_position(symbol, position.strategy_name, current_price)
+                                continue
     
     def _update_equity(self) -> None:
         """Update equity curve."""
-        position_value = 0.0
+        unrealized_pnl = 0.0
         for symbol, position in self.positions.items():
             if position.side != PositionSide.NEUTRAL:
                 price = self._current_prices.get(symbol, position.current_price)
-                position_value += position.quantity * price
+                if position.side == PositionSide.LONG:
+                    unrealized_pnl += (price - position.entry_price) * position.quantity
+                elif position.side == PositionSide.SHORT:
+                    unrealized_pnl += (position.entry_price - price) * position.quantity
         
-        total_equity = self.current_capital + position_value
+        total_equity = self.current_capital + unrealized_pnl
         self.equity_curve.append(total_equity)
     
     def _calculate_metrics(self) -> Dict[str, BacktestMetrics]:

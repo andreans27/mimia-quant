@@ -42,11 +42,11 @@ class MultiTimeframeStrategy(BaseStrategy):
             "primary_timeframe": "1h",
             "secondary_timeframe": "4h",
             "tertiary_timeframe": "1d",
-            "alignment_threshold": 2,
+            "alignment_threshold": 1,
             "trend_ma_period": 50,
             "momentum_period": 14,
             "cooldown_period_seconds": 600,
-            "min_strength": 0.7,
+            "min_strength": 0.1,
             "position_size_pct": 0.12,
         }
         if config:
@@ -289,7 +289,7 @@ class MultiTimeframeStrategy(BaseStrategy):
         alignment_count, strength, direction = self.calculate_alignment_score(tf_analysis)
         
         # Need at least the threshold number of aligned indicators
-        if alignment_count < self.alignment_threshold * 3:  # 3 indicators per tf
+        if alignment_count < self.alignment_threshold * 2:  # 2 indicators per tf
             return None
         
         # Determine signal side and strength
@@ -301,13 +301,18 @@ class MultiTimeframeStrategy(BaseStrategy):
             return None
         
         # Combine strength from alignment and timeframe analysis
-        combined_strength = strength * alignment_count / 9  # Normalize
+        combined_strength = max(strength, alignment_count / 9.0)
         
-        if combined_strength < 0.3:
+        # RSI extreme signals: boost combined_strength if RSI is extreme on primary
+        primary_analysis = tf_analysis.get("primary", list(tf_analysis.values())[0])
+        primary_rsi = primary_analysis.get("rsi", 50)
+        if primary_rsi < 25 or primary_rsi > 75:
+            combined_strength += 0.3
+        
+        if combined_strength < 0.1:
             return None
         
         # Get current price and indicators from primary timeframe
-        primary_analysis = tf_analysis.get("primary", list(tf_analysis.values())[0])
         current_price = primary_analysis["price"]
         
         # Create signal

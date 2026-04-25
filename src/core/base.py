@@ -101,6 +101,8 @@ class Position:
     quantity: float = 0.0
     entry_price: float = 0.0
     current_price: float = 0.0
+    highest_price: float = 0.0  # Highest price since entry (for trailing stop)
+    lowest_price: float = 0.0   # Lowest price since entry (for trailing stop)
     unrealized_pnl: float = 0.0
     realized_pnl: float = 0.0
     opened_at: datetime = field(default_factory=datetime.now)

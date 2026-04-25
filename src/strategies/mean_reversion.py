@@ -46,7 +46,7 @@ class MeanReversionStrategy(BaseStrategy):
             "entry_threshold": 1.5,
             "exit_threshold": 0.5,
             "cooldown_period_seconds": 600,
-            "min_strength": 0.6,
+            "min_strength": 0.3,
             "position_size_pct": 0.1,
         }
         if config:

@@ -40,13 +40,13 @@ class BreakoutStrategy(BaseStrategy):
         default_config = {
             "enabled": True,
             "lookback_period": 20,
-            "breakout_threshold_pct": 0.5,
+            "breakout_threshold_pct": 0.3,
             "volume_ma_period": 20,
             "volume_confirmation": True,
             "atr_period": 14,
             "consolidation_threshold": 2.0,
             "cooldown_period_seconds": 300,
-            "min_strength": 0.65,
+            "min_strength": 0.15,
             "position_size_pct": 0.15,
         }
         if config:
@@ -223,8 +223,8 @@ class BreakoutStrategy(BaseStrategy):
         if upper_breakout > self.breakout_threshold_pct:
             breakout_type = "up"
             
-            # Volume confirmation
-            if self.volume_confirmation and current_volume_ratio < 1.0:
+            # Volume confirmation (more lenient)
+            if self.volume_confirmation and current_volume_ratio < 0.5:
                 return None
             
             strength = min(upper_breakout * 10, 1.0)
@@ -238,8 +238,8 @@ class BreakoutStrategy(BaseStrategy):
         elif lower_breakout > self.breakout_threshold_pct:
             breakout_type = "down"
             
-            # Volume confirmation
-            if self.volume_confirmation and current_volume_ratio < 1.0:
+            # Volume confirmation (more lenient)
+            if self.volume_confirmation and current_volume_ratio < 0.5:
                 return None
             
             strength = min(lower_breakout * 10, 1.0)
@@ -263,8 +263,21 @@ class BreakoutStrategy(BaseStrategy):
                 strength = 0.6
                 side = OrderSide.SELL
         
+        # Momentum breakout: price moves > 1% in last 3 bars with increasing volume
+        if breakout_type == "none":
+            price_change_3 = abs(float(closes.iloc[-1]) - float(closes.iloc[-4])) / float(closes.iloc[-4]) if len(closes) > 4 else 0.0
+            if price_change_3 > 0.01 and current_volume_ratio > 1.0:
+                if closes.iloc[-1] > closes.iloc[-4]:
+                    breakout_type = "momentum_up"
+                    strength = 0.5
+                    side = OrderSide.BUY
+                else:
+                    breakout_type = "momentum_down"
+                    strength = 0.5
+                    side = OrderSide.SELL
+        
         # Check if signal meets minimum threshold
-        if strength < 0.3:
+        if strength < 0.15:
             return None
         
         # Create signal

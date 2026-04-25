@@ -42,9 +42,9 @@ class MomentumStrategy(BaseStrategy):
             "rsi_overbought": 70,
             "rsi_oversold": 30,
             "momentum_period": 20,
-            "min_momentum": 0.02,
+            "min_momentum": 0.005,
             "cooldown_period_seconds": 300,
-            "min_strength": 0.6,
+            "min_strength": 0.15,
             "position_size_pct": 0.1,
         }
         if config:
@@ -155,17 +155,22 @@ class MomentumStrategy(BaseStrategy):
         current_price = closes.iloc[-1]
         current_ema_fast = ema_fast.iloc[-1]
         current_ema_slow = ema_slow.iloc[-1]
+        prev_momentum = momentum.iloc[-2] if len(momentum) > 1 else 0.0
+        prev_ema_fast = ema_fast.iloc[-2] if len(ema_fast) > 1 else current_ema_fast
+        prev_ema_slow = ema_slow.iloc[-2] if len(ema_slow) > 1 else current_ema_slow
         
         # Calculate signal strength based on multiple factors
         strength = 0.0
         side = OrderSide.BUY
         
-        # RSI-based signal
+        # RSI-based signal (trend-confirming: overbought = strength, oversold = weakness)
         rsi_signal = 0.0
         if current_rsi < self.rsi_oversold:
-            rsi_signal = (self.rsi_oversold - current_rsi) / self.rsi_oversold
+            # Oversold = weakness → sell signal
+            rsi_signal = -(self.rsi_oversold - current_rsi) / self.rsi_oversold
         elif current_rsi > self.rsi_overbought:
-            rsi_signal = -(current_rsi - self.rsi_overbought) / (100 - self.rsi_overbought)
+            # Overbought = strength → buy signal
+            rsi_signal = (current_rsi - self.rsi_overbought) / (100 - self.rsi_overbought)
         
         # Momentum-based signal
         momentum_signal = 0.0
@@ -174,15 +179,26 @@ class MomentumStrategy(BaseStrategy):
         elif current_momentum < -self.min_momentum:
             momentum_signal = max(current_momentum / 0.1, -1.0)
         
-        # EMA crossover signal
-        ema_signal = 0.0
-        if current_ema_fast > current_ema_slow:
-            ema_signal = (current_ema_fast - current_ema_slow) / current_ema_slow
-        else:
-            ema_signal = -(current_ema_slow - current_ema_fast) / current_ema_slow
+        # Momentum direction change detection
+        momentum_change_boost = 0.0
+        if prev_momentum < 0 and current_momentum > 0:
+            momentum_change_boost = 0.3  # Bullish momentum reversal
+        elif prev_momentum > 0 and current_momentum < 0:
+            momentum_change_boost = -0.3  # Bearish momentum reversal
         
-        # Combine signals with weights
-        combined = (rsi_signal * 0.3 + momentum_signal * 0.4 + ema_signal * 0.3)
+        # EMA crossover detection (1.0 for fresh crossover, 0.5 for already crossed, 0 for no cross)
+        ema_signal = 0.0
+        if prev_ema_fast <= prev_ema_slow and current_ema_fast > current_ema_slow:
+            ema_signal = 1.0  # Fresh bullish crossover
+        elif prev_ema_fast >= prev_ema_slow and current_ema_fast < current_ema_slow:
+            ema_signal = -1.0  # Fresh bearish crossover
+        elif current_ema_fast > current_ema_slow:
+            ema_signal = 0.5  # Already crossed bullish
+        elif current_ema_fast < current_ema_slow:
+            ema_signal = -0.5  # Already crossed bearish
+        
+        # Combine signals with weights (reduced EMA weight since crossover is binary)
+        combined = (rsi_signal * 0.25 + momentum_signal * 0.25 + ema_signal * 0.35 + momentum_change_boost * 0.15)
         
         # Determine side and strength
         if combined > 0:
@@ -195,7 +211,7 @@ class MomentumStrategy(BaseStrategy):
             return None
         
         # Check if signal meets minimum threshold
-        if strength < 0.3:
+        if strength < 0.15:
             return None
         
         # Create signal

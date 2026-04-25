@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "mimia-quant"
+version = "1.0.0"
+description = "Systematic quant trading agent for Binance crypto perpetual futures"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.json", "*.txt"]

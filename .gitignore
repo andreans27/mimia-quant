@@ -105,3 +105,21 @@ metrics/
 
 # Coverage reports
 htmlcov/
+
+# Large data artifacts (not for version control)
+data/ml_cache/
+data/ml_models/
+data/backtest_results/
+data/rl_models/
+data/market_data/
+data/*.json
+data/*.log
+data/*.txt
+scripts/__pycache__/
+scripts/*.pyc
+*.parquet
+*.db
+models/
+
+# Debug scripts
+debug_*.py

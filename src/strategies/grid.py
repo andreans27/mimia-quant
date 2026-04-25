@@ -41,7 +41,7 @@ class GridStrategy(BaseStrategy):
             "grid_levels": 10,
             "grid_spacing_pct": 1.0,
             "total_investment_pct": 0.5,
-            "rebalance_threshold": 0.2,
+            "rebalance_threshold": 0.05,
             "profit_target_pct": 0.5,
             "cooldown_period_seconds": 60,
             "min_strength": 0.0,  # Grid doesn't need strength validation
@@ -208,19 +208,29 @@ class GridStrategy(BaseStrategy):
             min_distance = min(min_distance, distance)
         
         # Generate signal based on proximity to grid levels
-        if min_distance < 0.005:  # Within 0.5% of a grid level
+        if min_distance < 0.015:  # Within 1.5% of a grid level
             # Find closest level
             for i, price in enumerate(lower_prices):
-                if abs(current_price - price) / current_price < 0.005:
+                if abs(current_price - price) / current_price < 0.015:
                     side = OrderSide.BUY
                     strength = 0.7
                     break
             else:
                 for i, price in enumerate(upper_prices):
-                    if abs(current_price - price) / current_price < 0.005:
+                    if abs(current_price - price) / current_price < 0.015:
                         side = OrderSide.SELL
                         strength = 0.7
                         break
+        
+        # Always generate a signal with at least 0.3 strength if the trend is clear
+        elif current_price > current_ema_20 and current_price > current_ema_50:
+            # Clear uptrend
+            strength = max(strength, 0.3)
+            side = OrderSide.BUY
+        elif current_price < current_ema_20 and current_price < current_ema_50:
+            # Clear downtrend
+            strength = max(strength, 0.3)
+            side = OrderSide.SELL
         
         # Check for rebalancing need
         if self.should_rebalance(current_price, reference_price):

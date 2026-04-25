@@ -216,7 +216,7 @@ class BinanceRESTClient:
         """Get funding rate history for a symbol."""
         try:
             data = self._call(
-                'funding_rates',
+                'get_funding_rate_history',
                 symbol=symbol.upper(),
                 limit=limit
             )
@@ -225,6 +225,94 @@ class BinanceRESTClient:
             return data
         except Exception as e:
             raise Exception(f"Failed to get funding rate: {e}")
+
+    def get_funding_rate_info(self, symbol: str) -> Dict[str, Any]:
+        """Get current funding rate info for a symbol."""
+        try:
+            data = self._call('get_funding_rate_info', symbol=symbol.upper())
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
+            raise Exception(f"Failed to get funding rate info: {e}")
+
+    def get_orderbook_depth(
+        self,
+        symbol: str,
+        limit: int = 100
+    ) -> Dict[str, Any]:
+        """Alias for get_order_book. Get order book depth for a symbol."""
+        return self.get_order_book(symbol, limit)
+
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str = "MARKET",
+        quantity: float = 0.0,
+        price: Optional[float] = None,
+        stop_price: Optional[float] = None,
+        reduce_only: bool = False,
+        position_side: Optional[str] = None,
+        time_in_force: str = "GTC",
+    ) -> Dict[str, Any]:
+        """Place an order on Binance Futures testnet."""
+        try:
+            kwargs = dict(
+                symbol=symbol.upper(),
+                side=side,
+                type=order_type,
+                quantity=quantity,
+            )
+            if price is not None:
+                kwargs['price'] = price
+            if stop_price is not None:
+                kwargs['stop_price'] = stop_price
+            if reduce_only:
+                kwargs['reduce_only'] = reduce_only
+            if position_side:
+                kwargs['position_side'] = position_side
+            if order_type != "MARKET":
+                kwargs['time_in_force'] = time_in_force
+
+            data = self._call('new_order', **kwargs)
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
+            raise Exception(f"Failed to place order: {e}")
+
+    def cancel_order(
+        self,
+        symbol: str,
+        order_id: Optional[int] = None,
+        orig_client_order_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Cancel an open order."""
+        try:
+            kwargs = dict(symbol=symbol.upper())
+            if order_id is not None:
+                kwargs['order_id'] = order_id
+            if orig_client_order_id is not None:
+                kwargs['orig_client_order_id'] = orig_client_order_id
+            data = self._call('cancel_order', **kwargs)
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
+            raise Exception(f"Failed to cancel order: {e}")
+
+    def change_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
+        """Change leverage for a symbol."""
+        try:
+            data = self._call('change_initial_leverage', symbol=symbol.upper(), leverage=leverage)
+            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
+        except Exception as e:
+            raise Exception(f"Failed to change leverage: {e}")
+
+    def get_position_info_v3(self) -> List[Dict[str, Any]]:
+        """Get position information using v3 endpoint."""
+        try:
+            data = self._call('position_information_v3')
+            if isinstance(data, list):
+                return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
+            return data
+        except Exception as e:
+            raise Exception(f"Failed to get position info v3: {e}")
 
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all open orders, optionally filtered by symbol."""
