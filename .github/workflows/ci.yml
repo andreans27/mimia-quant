@@ -231,13 +231,22 @@ jobs:
       - name: Validate configuration
         run: |
           python -c "
-            import yaml
+            import sys
+            try:
+                import yaml
+                print('yaml imported OK, version:', yaml.__version__)
+            except ImportError as e:
+                print('yaml import FAILED:', e)
+                sys.exit(1)
             with open('config/config.yaml') as f:
                 config = yaml.safe_load(f)
-                print('Config loaded:', config.get('system', {}).get('name'))
+                name = config.get('system', {}).get('name')
+                print('Config loaded:', name)
             with open('configs/strategies.yaml') as f:
                 strategies = yaml.safe_load(f)
-                print('Strategies:', list(strategies.get('strategies', {}).keys()))
+                keys = list(strategies.get('strategies', {}).keys())
+                print('Strategies:', keys)
+            print('All configs valid!')
           "
 
       - name: Check required files
