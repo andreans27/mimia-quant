@@ -3,10 +3,10 @@ Prepare ML dataset: fetch multi-timeframe data & compute features for all pairs.
 Saves to data/ml_cache/ for reuse.
 """
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.strategies.ml_features import prepare_ml_dataset
-from pathlib import Path
 import pandas as pd
 import gc
 

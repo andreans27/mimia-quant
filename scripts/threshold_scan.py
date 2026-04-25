@@ -7,11 +7,11 @@ all thresholds (0.50-0.70, step 0.05) on the same predictions.
 Usage: python scripts/threshold_scan.py 2>&1 | tee data/threshold_scan.log
 """
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pandas as pd
-from pathlib import Path
 from datetime import datetime, timedelta
 import json, warnings, requests, random
 warnings.filterwarnings('ignore')

@@ -15,11 +15,11 @@ Usage: python scripts/ml_voting_backtest.py sweep <thresholds> <hold> <cool>
 """
 
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pandas as pd
-from pathlib import Path
 from datetime import datetime, timedelta
 import json
 import warnings

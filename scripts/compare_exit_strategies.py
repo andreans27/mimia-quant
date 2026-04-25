@@ -15,10 +15,11 @@ Exits tested:
   trailing_2pct     + 2% trailing stop from peak
 """
 
-import sys; sys.path.insert(0, '.')
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 import pandas as pd
-from pathlib import Path
 from datetime import datetime
 import json, warnings, time, argparse
 import xgboost as xgb

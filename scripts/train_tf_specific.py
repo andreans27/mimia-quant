@@ -6,12 +6,12 @@ All models predict at 5m resolution → aligned for voting.
 Usage: python scripts/train_tf_specific.py
 """
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pandas as pd
 import json
-from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Tuple
 

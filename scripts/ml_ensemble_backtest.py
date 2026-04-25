@@ -3,11 +3,11 @@ Ensemble ML backtest — 5m base, 5 models voting, pure signal (hold N bars).
 Loads cached features from the 5m multi-TF pipeline, aligns with OHLCV data.
 """
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pandas as pd
-from pathlib import Path
 from datetime import datetime, timedelta
 import json
 import warnings

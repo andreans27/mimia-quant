@@ -1,6 +1,7 @@
 """Quick test: fetch data for BTCUSDT and verify pagination + features."""
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.strategies.ml_features import prepare_ml_dataset
 import pandas as pd
 

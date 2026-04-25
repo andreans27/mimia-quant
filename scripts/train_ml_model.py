@@ -2,12 +2,12 @@
 Train XGBoost model on multi-timeframe features for crypto trading.
 """
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pandas as pd
 import json
-from pathlib import Path
 from datetime import datetime
 
 import xgboost as xgb

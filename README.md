@@ -14,7 +14,7 @@
 
 | Metric | Value |
 |--------|-------|
-| **Mode** | 🟡 Paper Trading (Testnet) |
+| **Mode** | 🟡 Live Trading (Testnet) |
 | **Capital** | ~$4,996 USDT |
 | **Pairs** | 10 (APT, UNI, FET, TIA, SOL, OP, 1000PEPE, SUI, ARB, INJ) |
 | **Strategy** | Multi-TF XGBoost Ensemble (5m, 15m, 30m, 1h, 4h) |
@@ -59,9 +59,9 @@
 ```
 ┌──────────────────────────────────────────────────────┐
 │                   Cron Scheduler                      │
-│           Every 60 min → paper_trader.py              │
+│           Every 60 min → live_trader.py               │
 ├──────────────────────────────────────────────────────┤
-│               Paper Trading Engine                     │
+│               Live Trading Engine                       │
 │  ┌──────────┐  ┌──────────┐  ┌────────────────────┐  │
 │  │ Signal    │  │ Position │  │ Risk /             │  │
 │  │ Pipeline  │→ │ Manager  │→ │ Position Sizing    │  │
@@ -87,7 +87,7 @@
 | Layer | Component | Description |
 |-------|-----------|-------------|
 | **Domain** | `strategy.py`, `signal.py` | Core business logic — signal generation, edge detection |
-| **Application** | `paper_trader.py` | Orchestrates signal evaluation, trade execution, risk checks |
+| **Application** | `live_trader.py` | Orchestrates signal evaluation, trade execution, risk checks |
 | **Infrastructure** | `binance_sdk`, `sqlite`, `telegram` | Exchange connectivity, persistence, notifications |
 
 ---
@@ -106,7 +106,7 @@ XGBoost Training (depth=3, reg_alpha=1.0, reg_lambda=3.0)
         ↓
 Grid Threshold Scan (0.50–0.90)
         ↓
-Optimal Threshold Selected → Paper Trade
+Optimal Threshold Selected → Live Trade
 
 16 symbols × 25 models = 400 models total
 ```
@@ -161,10 +161,10 @@ cp .env.example .env
 make test
 ```
 
-### Start Paper Trading
+### Start Live Trading
 
 ```bash
-python scripts/paper_trader.py
+python scripts/live_trader.py
 ```
 
 Or deploy as a cron job (runs automatically every 60 min):
@@ -179,7 +179,7 @@ Or deploy as a cron job (runs automatically every 60 min):
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `INITIAL_CAPITAL` | 5,000 USDT | Starting capital for paper trading |
+| `INITIAL_CAPITAL` | 5,000 USDT | Starting capital for live trading |
 | `LEVERAGE_X` | 10 | Leverage (testnet only) |
 | `RISK_PER_TRADE` | 1% | Max risk per position |
 | `SIGNAL_THRESHOLD` | 0.60 | Minimum ensemble probability to enter |
@@ -219,7 +219,7 @@ Every push to `main` triggers:
 ## 📋 Roadmap
 
 - [x] ML pipeline — Multi-TF XGBoost ensemble
-- [x] Paper trading engine — live testnet integration
+- [x] Live trading engine — live testnet integration
 - [x] Risk management — Kelly sizing + kill switches
 - [x] CI/CD — GitHub Actions pipeline
 - [ ] Live deployment — mainnet with reduced sizing

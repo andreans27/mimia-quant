@@ -17,8 +17,7 @@ from typing import Dict, List
 import pandas as pd
 import numpy as np
 
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
-sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.core.config import get_config
 from src.strategies.momentum import MomentumStrategy

@@ -4,14 +4,12 @@ Tests for Mimia Quant Redis Client Module
 
 import os
 import sys
-import time
 import json
-from datetime import datetime
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.core.redis_client import RedisClient, RedisManager
 

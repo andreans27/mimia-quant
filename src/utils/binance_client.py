@@ -7,8 +7,6 @@ import os
 import sys
 from typing import Optional, Dict, Any, List, Union
 
-# Add the venv site-packages to path if needed
-sys.path.insert(0, '/root/.hermes/hermes-agent/venv/lib/python3.11/site-packages')
 
 from binance_sdk_derivatives_trading_usds_futures import (
     DerivativesTradingUsdsFutures,
@@ -96,7 +94,7 @@ class BinanceRESTClient:
             data = self._call('account_information_v3')
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to get account info: {e}")
+            raise Exception(f"Failed to get account info: {e}") from e
 
     def get_balance(self) -> List[Dict[str, Any]]:
         """Get futures account balance."""
@@ -106,7 +104,7 @@ class BinanceRESTClient:
                 return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
             return data
         except Exception as e:
-            raise Exception(f"Failed to get balance: {e}")
+            raise Exception(f"Failed to get balance: {e}") from e
 
     def get_position_info(self) -> List[Dict[str, Any]]:
         """Get current positions information."""
@@ -116,7 +114,7 @@ class BinanceRESTClient:
                 return [self._pydantic_to_dict(p) if hasattr(p, 'model_dump') else p for p in data.positions]
             return []
         except Exception as e:
-            raise Exception(f"Failed to get position info: {e}")
+            raise Exception(f"Failed to get position info: {e}") from e
 
     def get_exchange_info(self) -> Dict[str, Any]:
         """Get exchange trading rules and symbol information."""
@@ -124,7 +122,7 @@ class BinanceRESTClient:
             data = self._call('exchange_information')
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to get exchange info: {e}")
+            raise Exception(f"Failed to get exchange info: {e}") from e
 
     def get_symbol_info(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Get information for a specific trading pair."""
@@ -136,7 +134,7 @@ class BinanceRESTClient:
                     return sym
             return None
         except Exception as e:
-            raise Exception(f"Failed to get symbol info: {e}")
+            raise Exception(f"Failed to get symbol info: {e}") from e
 
     def get_klines(
         self,
@@ -169,7 +167,7 @@ class BinanceRESTClient:
                     ] for item in data]
             return data
         except Exception as e:
-            raise Exception(f"Failed to get klines: {e}")
+            raise Exception(f"Failed to get klines: {e}") from e
 
     def get_order_book(
         self,
@@ -185,7 +183,7 @@ class BinanceRESTClient:
             )
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to get order book: {e}")
+            raise Exception(f"Failed to get order book: {e}") from e
 
     def get_recent_trades(self, symbol: str, limit: int = 500) -> List[Dict[str, Any]]:
         """Get recent trades for a symbol."""
@@ -199,7 +197,7 @@ class BinanceRESTClient:
                 return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
             return data
         except Exception as e:
-            raise Exception(f"Failed to get recent trades: {e}")
+            raise Exception(f"Failed to get recent trades: {e}") from e
 
     def get_mark_price(self, symbol: str) -> Dict[str, Any]:
         """Get current mark price for a symbol."""
@@ -210,7 +208,7 @@ class BinanceRESTClient:
             )
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to get mark price: {e}")
+            raise Exception(f"Failed to get mark price: {e}") from e
 
     def get_funding_rate(self, symbol: str, limit: int = 100) -> List[Dict[str, Any]]:
         """Get funding rate history for a symbol."""
@@ -224,15 +222,43 @@ class BinanceRESTClient:
                 return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
             return data
         except Exception as e:
-            raise Exception(f"Failed to get funding rate: {e}")
+            raise Exception(f"Failed to get funding rate: {e}") from e
 
     def get_funding_rate_info(self, symbol: str) -> Dict[str, Any]:
-        """Get current funding rate info for a symbol."""
+        """Get current funding rate info for a symbol.
+
+        NOTE: SDK's get_funding_rate_info() accepts NO parameters and returns data
+        for ALL symbols. It also returns 404 on testnet (/fapi/v1/fundingInfo not available).
+        This wrapper falls back to get_funding_rate(symbol, limit=1) on failure.
+        """
         try:
-            data = self._call('get_funding_rate_info', symbol=symbol.upper())
+            data = self._call('get_funding_rate_info')
+            if isinstance(data, list):
+                for item in data:
+                    if hasattr(item, 'symbol') and item.symbol == symbol.upper():
+                        return self._pydantic_to_dict(item)
+                for item in data:
+                    if isinstance(item, dict) and item.get('symbol') == symbol.upper():
+                        return item
+                # Try converting list items
+                for item in data:
+                    d = self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item
+                    if isinstance(d, dict) and d.get('symbol') == symbol.upper():
+                        return d
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
-        except Exception as e:
-            raise Exception(f"Failed to get funding rate info: {e}")
+        except Exception:
+            # Fallback: use get_funding_rate_history with limit=1
+            try:
+                rates = self.get_funding_rate(symbol, limit=1)
+                if isinstance(rates, list) and rates:
+                    return {
+                        'symbol': rates[0].get('symbol', symbol.upper()),
+                        'lastFundingRate': rates[0].get('fundingRate', 0),
+                        'fundingTime': rates[0].get('fundingTime', 0),
+                    }
+                return {}
+            except Exception as e2:
+                raise Exception(f"Failed to get funding rate info for {symbol}: {e2}") from e
 
     def get_orderbook_depth(
         self,
@@ -276,7 +302,7 @@ class BinanceRESTClient:
             data = self._call('new_order', **kwargs)
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to place order: {e}")
+            raise Exception(f"Failed to place order: {e}") from e
 
     def cancel_order(
         self,
@@ -294,7 +320,7 @@ class BinanceRESTClient:
             data = self._call('cancel_order', **kwargs)
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to cancel order: {e}")
+            raise Exception(f"Failed to cancel order: {e}") from e
 
     def change_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
         """Change leverage for a symbol."""
@@ -302,7 +328,7 @@ class BinanceRESTClient:
             data = self._call('change_initial_leverage', symbol=symbol.upper(), leverage=leverage)
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to change leverage: {e}")
+            raise Exception(f"Failed to change leverage: {e}") from e
 
     def get_position_info_v3(self) -> List[Dict[str, Any]]:
         """Get position information using v3 endpoint."""
@@ -312,7 +338,7 @@ class BinanceRESTClient:
                 return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
             return data
         except Exception as e:
-            raise Exception(f"Failed to get position info v3: {e}")
+            raise Exception(f"Failed to get position info v3: {e}") from e
 
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all open orders, optionally filtered by symbol."""
@@ -322,7 +348,7 @@ class BinanceRESTClient:
                 return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
             return data
         except Exception as e:
-            raise Exception(f"Failed to get open orders: {e}")
+            raise Exception(f"Failed to get open orders: {e}") from e
 
     def get_all_orders(
         self,
@@ -344,7 +370,7 @@ class BinanceRESTClient:
                 return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
             return data
         except Exception as e:
-            raise Exception(f"Failed to get all orders: {e}")
+            raise Exception(f"Failed to get all orders: {e}") from e
 
     def get_order(
         self,
@@ -362,7 +388,7 @@ class BinanceRESTClient:
             )
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to get order: {e}")
+            raise Exception(f"Failed to get order: {e}") from e
 
     def create_order(
         self,
@@ -407,7 +433,7 @@ class BinanceRESTClient:
             data = self._call('place_order', **params)
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to create order: {e}")
+            raise Exception(f"Failed to create order: {e}") from e
 
     def create_market_order(
         self,
@@ -472,31 +498,13 @@ class BinanceRESTClient:
             position_side=position_side
         )
 
-    def cancel_order(
-        self,
-        symbol: str,
-        order_id: Optional[int] = None,
-        orig_client_order_id: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """Cancel an open order."""
-        try:
-            data = self._call(
-                'cancel_order',
-                symbol=symbol.upper(),
-                order_id=order_id,
-                orig_client_order_id=orig_client_order_id
-            )
-            return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
-        except Exception as e:
-            raise Exception(f"Failed to cancel order: {e}")
-
     def cancel_all_open_orders(self, symbol: str) -> Dict[str, Any]:
         """Cancel all open orders for a symbol."""
         try:
             data = self._call('cancel_all_open_orders', symbol=symbol.upper())
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to cancel all orders: {e}")
+            raise Exception(f"Failed to cancel all orders: {e}") from e
 
     def cancel_orders(
         self,
@@ -512,7 +520,7 @@ class BinanceRESTClient:
             )
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to cancel orders: {e}")
+            raise Exception(f"Failed to cancel orders: {e}") from e
 
     def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
         """Set leverage for a symbol."""
@@ -524,7 +532,7 @@ class BinanceRESTClient:
             )
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to set leverage: {e}")
+            raise Exception(f"Failed to set leverage: {e}") from e
 
     def set_margin_type(
         self,
@@ -542,7 +550,7 @@ class BinanceRESTClient:
             )
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to set margin type: {e}")
+            raise Exception(f"Failed to set margin type: {e}") from e
 
     def get_leverage_bracket(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get leverage bracket for a symbol or all symbols."""
@@ -552,7 +560,7 @@ class BinanceRESTClient:
                 return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
             return data
         except Exception as e:
-            raise Exception(f"Failed to get leverage bracket: {e}")
+            raise Exception(f"Failed to get leverage bracket: {e}") from e
 
     def get_position_mode(self) -> Dict[str, Any]:
         """Get current position mode (hedge mode or one-way)."""
@@ -560,7 +568,7 @@ class BinanceRESTClient:
             data = self._call('get_position_mode')
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to get position mode: {e}")
+            raise Exception(f"Failed to get position mode: {e}") from e
 
     def set_position_mode(self, hedge_mode: bool) -> Dict[str, Any]:
         """Set position mode (hedge mode or one-way)."""
@@ -568,7 +576,7 @@ class BinanceRESTClient:
             data = self._call('change_position_mode', dual_position_side=hedge_mode)
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to set position mode: {e}")
+            raise Exception(f"Failed to set position mode: {e}") from e
 
     def get_income_history(
         self,
@@ -592,7 +600,7 @@ class BinanceRESTClient:
                 return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
             return data
         except Exception as e:
-            raise Exception(f"Failed to get income history: {e}")
+            raise Exception(f"Failed to get income history: {e}") from e
 
     def get_notional_and_leverage(
         self,
@@ -605,7 +613,7 @@ class BinanceRESTClient:
                 return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
             return data
         except Exception as e:
-            raise Exception(f"Failed to get notional and leverage: {e}")
+            raise Exception(f"Failed to get notional and leverage: {e}") from e
 
     def get_account_trades(
         self,
@@ -627,7 +635,7 @@ class BinanceRESTClient:
                 return [self._pydantic_to_dict(item) if hasattr(item, 'model_dump') else item for item in data]
             return data
         except Exception as e:
-            raise Exception(f"Failed to get account trades: {e}")
+            raise Exception(f"Failed to get account trades: {e}") from e
 
     def get_server_time(self) -> Dict[str, Any]:
         """Get server time."""
@@ -635,15 +643,16 @@ class BinanceRESTClient:
             data = self._call('check_server_time')
             return self._pydantic_to_dict(data) if hasattr(data, 'model_dump') else data
         except Exception as e:
-            raise Exception(f"Failed to get server time: {e}")
+            raise Exception(f"Failed to get server time: {e}") from e
 
     def ping(self) -> Dict[str, Any]:
         """Ping the Binance API to check connectivity."""
         try:
-            data = self._call('check_server_time')
+            # Use lightweight ping endpoint instead of check_server_time
+            data = self._call('ping')
             return {"status": "ok"}
         except Exception as e:
-            raise Exception(f"Failed to ping: {e}")
+            raise Exception(f"Failed to ping: {e}") from e
 
     @staticmethod
     def _pydantic_to_dict(obj: Any) -> Dict[str, Any]:

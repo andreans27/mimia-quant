@@ -3,10 +3,9 @@
 
 import os
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-os.environ["BINANCE_TESTNET_API_KEY"] = "D3Wbkd8THmr8ZLGfB4NGtTVBlJcorYFeOCrCOltebRcPDIeHVekDssJFogzzaGX4"
-os.environ["BINANCE_TESTNET_API_SECRET"] = "lyAK3TKEatiRnQvwLV0ixBkfYPm1surlxythQ7j7pjZdWP2fcK9JHPtTPMOmTcoAx"
 
 from utils.binance_client import BinanceRESTClient
 
@@ -17,8 +16,8 @@ def main():
 
     client = BinanceRESTClient(
         testnet=True,
-        testnet_api_key=os.environ["BINANCE_TESTNET_API_KEY"],
-        testnet_api_secret=os.environ["BINANCE_TESTNET_API_SECRET"],
+        testnet_api_key=os.getenv("BINANCE_TESTNET_API_KEY", ""),
+        testnet_api_secret=os.getenv("BINANCE_TESTNET_API_SECRET", ""),
     )
 
     # Test account info

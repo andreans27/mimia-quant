@@ -3,12 +3,12 @@ ML Strategy — uses trained XGBoost models to generate signals on 15m data.
 Supports both long and short sides with confidence-based entry.
 """
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Optional, Tuple
-from pathlib import Path
 from datetime import datetime, timedelta
 
 import xgboost as xgb

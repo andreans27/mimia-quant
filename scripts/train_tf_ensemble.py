@@ -8,12 +8,12 @@ Examples:
   python scripts/train_tf_ensemble.py SOLUSDT 1h 1 120
 """
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 import pandas as pd
 import json
-from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 

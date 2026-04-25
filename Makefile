@@ -21,10 +21,10 @@ run:
 	python3 scripts/run_bot.py
 
 report:
-	python3 scripts/run_monitoring.py
+	python3 scripts/live_trader.py --report --testnet
 
 cron-setup:
-	python3 scripts/setup_cron.py
+	@echo "Use cronjob tool or 'crontab -e' directly to schedule: python3 scripts/live_trader.py"
 
 init-db:
 	python3 scripts/init_db.py

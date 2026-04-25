@@ -1,7 +1,6 @@
 """Train missing models for paper trade symbols (APT, FET, TIA, OP, PEPE, SUI, ARB, INJ)."""
-import sys; sys.path.insert(0, ".")
+import sys; from pathlib import Path; sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import subprocess
-from pathlib import Path
 
 MISSING = ["APTUSDT", "FETUSDT", "TIAUSDT", "OPUSDT",
            "1000PEPEUSDT", "SUIUSDT", "ARBUSDT", "INJUSDT"]
@@ -35,7 +34,7 @@ for sym in MISSING:
         print(f"{'='*60}")
         r = subprocess.run(
             ["python", "-c", f"""
-import sys; sys.path.insert(0, '.')
+import sys; sys.path.insert(0, '{ROOT}')
 from scripts.train_ml_ensemble import train_ensemble_symbol
 meta = train_ensemble_symbol('{sym}')
 print('DONE' if meta else 'FAILED')
@@ -53,7 +52,7 @@ print('DONE' if meta else 'FAILED')
             print(f"\n  Training {sym} {tf_prefix}...")
             r = subprocess.run(
                 ["python", "-c", f"""
-import sys; sys.path.insert(0, '.')
+import sys; sys.path.insert(0, '{ROOT}')
 from scripts.train_tf_specific import train_tf_specific, load_cached_features, get_tf_features, select_features
 import numpy as np; import pandas as pd; import json; import xgboost as xgb
 from sklearn.metrics import roc_auc_score, f1_score

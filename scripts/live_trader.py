@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Mimia Quant - Paper Trading Engine
+Mimia Quant - Live Trading Engine
 ====================================
-Live paper trading on Binance Futures testnet using the multi-TF XGBoost ensemble.
+Live trading on Binance Futures (testnet or mainnet) using the multi-TF XGBoost ensemble.
 Simulates trading with 10 pairs, logs everything to SQLite, reports via Telegram.
 
 Usage:
-    python scripts/paper_trader.py                      # Run once (for cron, every 5min)
-    python scripts/paper_trader.py --init               # Initialize DB + state
-    python scripts/paper_trader.py --status             # Show current state
-    python scripts/paper_trader.py --report             # Generate & send daily report
+    python scripts/live_trader.py                      # Run once (for cron, every 5min)
+    python scripts/live_trader.py --init               # Initialize DB + state
+    python scripts/live_trader.py --status             # Show current state
+    python scripts/live_trader.py --report             # Generate & send daily report
 """
 
 import sys
-sys.path.insert(0, ".")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import os
 from dotenv import load_dotenv
@@ -25,7 +26,6 @@ import sqlite3
 import argparse
 import warnings
 import traceback
-from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -39,10 +39,10 @@ warnings.filterwarnings('ignore')
 # ─── Constants ──────────────────────────────────────────────────────────────
 CACHE_DIR = Path("data/ml_cache")
 MODEL_DIR = Path("data/ml_models")
-DB_PATH = Path("data/paper_trading.db")
+DB_PATH = Path("data/live_trading.db")
 
 # Top 10 pairs sorted by win rate from full backtest
-PAPER_SYMBOLS = [
+LIVE_SYMBOLS = [
     "APTUSDT", "UNIUSDT", "FETUSDT", "TIAUSDT", "SOLUSDT",
     "OPUSDT", "1000PEPEUSDT", "SUIUSDT", "ARBUSDT", "INJUSDT",
 ]
@@ -65,18 +65,20 @@ FETCH_DAYS = 130
 
 # Telegram reporting
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+if not TELEGRAM_BOT_TOKEN:
+    print("⚠️  WARNING: TELEGRAM_BOT_TOKEN not set — Telegram reporting disabled")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "766684679")
 
 
 # ─── Database ───────────────────────────────────────────────────────────────
 def init_db():
-    """Initialize the paper trading database."""
+    """Initialize the live trading database."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
 
     c.executescript("""
-        CREATE TABLE IF NOT EXISTS paper_state (
+        CREATE TABLE IF NOT EXISTS live_state (
             symbol TEXT PRIMARY KEY,
             position INTEGER DEFAULT 0,
             entry_price REAL,
@@ -87,7 +89,7 @@ def init_db():
             qty REAL DEFAULT 0.0
         );
 
-        CREATE TABLE IF NOT EXISTS paper_trades (
+        CREATE TABLE IF NOT EXISTS live_trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
             direction TEXT NOT NULL,
@@ -103,7 +105,7 @@ def init_db():
             exit_reason TEXT DEFAULT 'hold_expiry'
         );
 
-        CREATE TABLE IF NOT EXISTS paper_signals (
+        CREATE TABLE IF NOT EXISTS live_signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT NOT NULL,
             timestamp INTEGER NOT NULL,
@@ -112,14 +114,14 @@ def init_db():
             capital REAL
         );
 
-        CREATE TABLE IF NOT EXISTS paper_capital (
+        CREATE TABLE IF NOT EXISTS live_capital (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp INTEGER NOT NULL,
             capital REAL NOT NULL,
             peak_capital REAL NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS paper_runs (
+        CREATE TABLE IF NOT EXISTS live_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp INTEGER NOT NULL,
             duration_ms INTEGER,
@@ -133,17 +135,17 @@ def init_db():
     """)
 
     # Initialize state for all symbols if not exists
-    for sym in PAPER_SYMBOLS:
+    for sym in LIVE_SYMBOLS:
         c.execute(
-            "INSERT OR IGNORE INTO paper_state (symbol) VALUES (?)",
+            "INSERT OR IGNORE INTO live_state (symbol) VALUES (?)",
             (sym,)
         )
 
     # Initialize capital tracker
-    c.execute("SELECT COUNT(*) FROM paper_capital")
+    c.execute("SELECT COUNT(*) FROM live_capital")
     if c.fetchone()[0] == 0:
         c.execute(
-            "INSERT INTO paper_capital (timestamp, capital, peak_capital) VALUES (?, ?, ?)",
+            "INSERT INTO live_capital (timestamp, capital, peak_capital) VALUES (?, ?, ?)",
             (int(time.time() * 1000), INITIAL_CAPITAL, INITIAL_CAPITAL)
         )
 
@@ -154,7 +156,7 @@ def init_db():
 def get_state(conn) -> Dict[str, Dict]:
     """Load current state for all symbols."""
     c = conn.cursor()
-    c.execute("SELECT * FROM paper_state")
+    c.execute("SELECT * FROM live_state")
     state = {}
     for row in c.fetchall():
         state[row[0]] = {
@@ -174,7 +176,7 @@ def save_state(conn, states: Dict[str, Dict]):
     c = conn.cursor()
     for sym, s in states.items():
         c.execute("""
-            UPDATE paper_state SET
+            UPDATE live_state SET
                 position=?, entry_price=?, entry_time=?, entry_proba=?,
                 hold_remaining=?, cooldown_remaining=?, qty=?
             WHERE symbol=?
@@ -188,11 +190,11 @@ def save_state(conn, states: Dict[str, Dict]):
 def get_capital(conn) -> Tuple[float, float]:
     """Get current capital and peak capital."""
     c = conn.cursor()
-    c.execute("SELECT capital FROM paper_capital ORDER BY id DESC LIMIT 1")
+    c.execute("SELECT capital FROM live_capital ORDER BY id DESC LIMIT 1")
     row = c.fetchone()
     if not row:
         return INITIAL_CAPITAL, INITIAL_CAPITAL
-    c.execute("SELECT MAX(peak_capital) FROM paper_capital")
+    c.execute("SELECT MAX(peak_capital) FROM live_capital")
     peak = c.fetchone()[0] or INITIAL_CAPITAL
     return row[0], peak
 
@@ -201,7 +203,7 @@ def update_capital(conn, capital: float, peak: float):
     """Update capital tracker."""
     c = conn.cursor()
     c.execute(
-        "INSERT INTO paper_capital (timestamp, capital, peak_capital) VALUES (?, ?, ?)",
+        "INSERT INTO live_capital (timestamp, capital, peak_capital) VALUES (?, ?, ?)",
         (int(time.time() * 1000), capital, peak)
     )
     conn.commit()
@@ -211,7 +213,7 @@ def log_signal(conn, symbol: str, timestamp: int, proba: float, signal: int, cap
     """Log a signal event."""
     c = conn.cursor()
     c.execute(
-        "INSERT INTO paper_signals (symbol, timestamp, proba, signal, capital) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO live_signals (symbol, timestamp, proba, signal, capital) VALUES (?, ?, ?, ?, ?)",
         (symbol, timestamp, proba, signal, capital)
     )
     conn.commit()
@@ -221,7 +223,7 @@ def log_trade(conn, trade: Dict):
     """Log a completed trade."""
     c = conn.cursor()
     c.execute("""
-        INSERT INTO paper_trades
+        INSERT INTO live_trades
             (symbol, direction, entry_time, exit_time, entry_price, exit_price,
              qty, pnl_net, pnl_pct, entry_proba, hold_bars, exit_reason)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -239,7 +241,7 @@ def log_run(conn, duration_ms: int, n_signals: int, n_opened: int, n_closed: int
     """Log a run cycle."""
     c = conn.cursor()
     c.execute("""
-        INSERT INTO paper_runs
+        INSERT INTO live_runs
             (timestamp, duration_ms, signals_generated, trades_opened,
              trades_closed, capital, peak, drawdown)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -507,55 +509,58 @@ class SignalGenerator:
             return None
 
 
-# ─── Paper Trading Engine ───────────────────────────────────────────────────
-class PaperTrader:
-    """Main paper trading engine."""
+# ─── Live Trading Engine ───────────────────────────────────────────────────
+class LiveTrader:
+    """Main live trading engine."""
 
-    def __init__(self, report: bool = False):
+    def __init__(self, report: bool = False, testnet: bool = True):
         init_db()
+        self.testnet = testnet
+        self.network = "testnet" if testnet else "mainnet"
         self.conn = sqlite3.connect(str(DB_PATH))
         self.gen = SignalGenerator()
         self.report_mode = report
         self._client = None  # lazy-init
 
     def _get_client(self):
-        """Lazy-init Binance testnet client."""
+        """Lazy-init Binance client (testnet or mainnet based on self.testnet)."""
         if self._client is None:
             from src.utils.binance_client import BinanceRESTClient
-            self._client = BinanceRESTClient(testnet=True)
+            self._client = BinanceRESTClient(testnet=self.testnet)
         return self._client
 
     def _init_leverage(self, symbol: str) -> bool:
-        """Set leverage to 10x on Binance testnet for a symbol. Returns True on success."""
+        """Set leverage to 10x on Binance Futures for a symbol. Returns True on success."""
         try:
             self._get_client().change_leverage(symbol, 10)
             return True
         except Exception:
             return False
 
-    def _setup_testnet(self):
+    def _setup_live_trading(self):
         """Reset stale positions in DB and init leverage for all symbols."""
+        net = self.network
         c = self.conn.cursor()
 
         # Check if we need initial setup (schema_version flag)
-        c.execute("SELECT COUNT(*) FROM paper_state WHERE position != 0")
+        c.execute("SELECT COUNT(*) FROM live_state WHERE position != 0")
         stale = c.fetchone()[0]
 
         if stale > 0:
-            print(f"\n  ⚠️ Found {stale} stale position(s) in DB (from old paper-only runs). Resetting...")
-            c.execute("UPDATE paper_state SET position=0, entry_price=0, entry_time=0, entry_proba=0, hold_remaining=0, cooldown_remaining=0, qty=0 WHERE position != 0")
+            print(f"\n  ⚠️ Found {stale} stale position(s) in DB (from old runs). Resetting...")
+            c.execute("UPDATE live_state SET position=0, entry_price=0, entry_time=0, entry_proba=0, hold_remaining=0, cooldown_remaining=0, qty=0 WHERE position != 0")
             self.conn.commit()
-            print(f"  ✅ Stale positions reset. New positions will be placed as real orders on Binance testnet.")
+            print(f"  ✅ Stale positions reset. New positions will be placed as real orders on Binance {net}.")
 
         # Init leverage 10x for all symbols
         ok = 0
-        for sym in PAPER_SYMBOLS:
+        for sym in LIVE_SYMBOLS:
             if self._init_leverage(sym):
                 ok += 1
-        print(f"  ✅ Leverage 10x set for {ok}/{len(PAPER_SYMBOLS)} symbols")
+        print(f"  ✅ Leverage 10x set for {ok}/{len(LIVE_SYMBOLS)} symbols")
 
     def _sync_binance_positions(self):
-        """Sync DB state with actual open positions on Binance testnet.
+        """Sync DB state with actual open positions on Binance (mainnet or testnet).
         Prevents duplicate position entries when script restarts."""
         try:
             client = self._get_client()
@@ -564,7 +569,7 @@ class PaperTrader:
             synced = 0
             for p in positions:
                 sym = p.get('symbol', '')
-                if sym.upper() not in PAPER_SYMBOLS:
+                if sym.upper() not in LIVE_SYMBOLS:
                     continue
                 pos_amt = float(p.get('position_amt', 0))
                 notional = float(p.get('notional', 0))
@@ -575,7 +580,7 @@ class PaperTrader:
                 entry_price = abs(notional / pos_amt) if pos_amt != 0 else 0
                 # Update DB state to match Binance
                 c.execute("""
-                    UPDATE paper_state
+                    UPDATE live_state
                     SET position=?, qty=?, entry_price=?, entry_time=?,
                         hold_remaining=?, cooldown_remaining=0
                     WHERE symbol=?
@@ -583,7 +588,7 @@ class PaperTrader:
                 synced += 1
             self.conn.commit()
             if synced > 0:
-                print(f"  🔄 Synced {synced} existing position(s) from Binance testnet")
+                print(f"  🔄 Synced {synced} existing position(s) from Binance {self.network}")
         except Exception as e:
             print(f"  ⚠️ Position sync skipped: {e}")
 
@@ -592,8 +597,6 @@ class PaperTrader:
 
     def send_telegram(self, message: str):
         """Send a message via Telegram bot."""
-        if not TELEGRAM_BOT_TOKEN:
-            return
         try:
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             requests.post(url, json={
@@ -605,18 +608,18 @@ class PaperTrader:
             print(f"    ⚠️ Telegram send failed: {e}")
 
     def run(self):
-        """Execute one full paper trading cycle."""
+        """Execute one full live trading cycle."""
         start_time = time.time()
         print(f"\n{'='*60}")
-        print(f"  PAPER TRADE RUN — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+        print(f"  LIVE TRADE RUN — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} {'(' + self.network.upper() + ')'}")
         print(f"{'='*60}")
 
         capital, peak_capital = get_capital(self.conn)
 
-        # Initial setup: reset stale positions (from old paper-only runs) and init leverage
-        self._setup_testnet()
+        # Initial setup: reset stale positions (from old runs) and init leverage
+        self._setup_live_trading()
 
-        # Sync DB state with actual positions on Binance testnet
+        # Sync DB state with actual positions on Binance ({self.network})
         # Prevents duplicate entries if trader restarts mid-position
         self._sync_binance_positions()
 
@@ -626,8 +629,8 @@ class PaperTrader:
         trades_closed = 0
         trade_report_lines = []
 
-        for i, symbol in enumerate(PAPER_SYMBOLS):
-            print(f"\n  [{i+1}/{len(PAPER_SYMBOLS)}] {symbol}...")
+        for i, symbol in enumerate(LIVE_SYMBOLS):
+            print(f"\n  [{i+1}/{len(LIVE_SYMBOLS)}] {symbol}...")
             state = states.get(symbol, {
                 'position': 0, 'entry_price': 0, 'entry_time': 0,
                 'entry_proba': 0, 'hold_remaining': 0,
@@ -702,7 +705,7 @@ class PaperTrader:
 
     def _enter_position(self, symbol: str, sig: Dict, state: Dict,
                         capital: float, peak_capital: float) -> Optional[Tuple[float, float]]:
-        """Enter a paper trade position — simulates in DB + places real MARKET order on Binance testnet."""
+        """Enter a live trade position — simulates in DB + places real MARKET order on Binance (testnet or mainnet)."""
         direction = sig['signal']  # 1=long, -1=short
         proba = sig['proba']
         direction_label = 'LONG' if direction == 1 else 'SHORT'
@@ -710,7 +713,7 @@ class PaperTrader:
         entry_price = None
         client = self._get_client()
 
-        # Step 1: Get current price and place real order on Binance testnet
+        # Step 1: Get current price and place real order on Binance
         try:
             ob = client.get_orderbook_depth(symbol)
             if direction == 1:
@@ -756,7 +759,7 @@ class PaperTrader:
         side = "BUY" if direction == 1 else "SELL"
         order_placed = False
         try:
-            # Place real order on Binance testnet
+            # Place real order on Binance
             order_resp = client.place_order(
                 symbol=symbol,
                 side=side,
@@ -769,12 +772,12 @@ class PaperTrader:
             avg_price_raw = float(order_resp.get('avg_price', 0))
 
             if executed_qty > 0 and avg_price_raw > 0:
-                # Order filled on testnet — use avg_price
+                # Order filled — use avg_price
                 entry_price = avg_price_raw
                 order_placed = True
                 print(f"    📡 ORDER FILLED: {side} {symbol} qty={executed_qty} @ ${avg_price_raw:.4f} (order #{order_id})")
             else:
-                # Order response shows NEW/unfilled — testnet has delayed fill updates
+                # Order response shows NEW/unfilled — Binance has delayed fill updates
                 # Wait briefly, then check if position was actually created
                 time.sleep(2)
                 actual_pos = None
@@ -800,8 +803,8 @@ class PaperTrader:
                     entry_price = price_ref * (1 + SLIPPAGE) if direction == 1 else price_ref * (1 - SLIPPAGE)
                     print(f"    📡 ORDER SUBMITTED (pending): {side} {symbol} order #{order_id} status={status} — using orderbook price ${entry_price:.4f}")
         except Exception as e:
-            print(f"    ⚠️ Binance order failed (paper-only fallback): {e}")
-            # Paper-only fallback: use orderbook price with slippage
+            print(f"    ⚠️ Binance order failed (fallback): {e}")
+            # Simulated fallback: use orderbook price with slippage
             entry_price = price_ref * (1 + SLIPPAGE) if direction == 1 else price_ref * (1 - SLIPPAGE)
 
         # Apply fee
@@ -825,14 +828,14 @@ class PaperTrader:
 
     def _exit_position(self, symbol: str, state: Dict,
                        capital: float, peak_capital: float) -> Optional[Tuple[float, float, str]]:
-        """Exit a paper trade position — simulates in DB + places real MARKET order on Binance testnet."""
+        """Exit a live trade position — simulates in DB + places real MARKET order on Binance (testnet or mainnet)."""
         direction = state['position']
         direction_label = 'LONG' if direction == 1 else 'SHORT'
 
         qty = state['qty']
         entry_price = state['entry_price']
 
-        # Place real exit order on Binance testnet
+        # Place real exit order on Binance
         client = self._get_client()
         exit_price = None
 
@@ -875,8 +878,8 @@ class PaperTrader:
                     exit_price = float(ob['asks'][0][0]) * (1 + SLIPPAGE)
                 print(f"    📡 EXIT ORDER SUBMITTED (pending): {side} {symbol} order #{order_id} status={status} — using orderbook price ${exit_price:.4f}")
         except Exception as e:
-            print(f"    ⚠️ Binance exit order failed (paper-only fallback): {e}")
-            # Paper-only fallback: get price from orderbook
+            print(f"    ⚠️ Binance exit order failed (fallback): {e}")
+            # Simulated fallback: get price from orderbook
             try:
                 ob = client.get_orderbook_depth(symbol)
                 if direction == 1:
@@ -953,7 +956,7 @@ class PaperTrader:
             SELECT COUNT(*), COALESCE(SUM(CASE WHEN pnl_net > 0 THEN 1 ELSE 0 END), 0),
                    COALESCE(SUM(pnl_net), 0), COALESCE(SUM(CASE WHEN pnl_net > 0 THEN pnl_net ELSE 0 END), 0),
                    COALESCE(SUM(CASE WHEN pnl_net < 0 THEN ABS(pnl_net) ELSE 0 END), 0)
-            FROM paper_trades
+            FROM live_trades
         """)
         row = c.fetchone()
         total_trades, wins, total_pnl, gross_profit, gross_loss = row
@@ -962,12 +965,12 @@ class PaperTrader:
 
         # Get open positions
         running_positions = []
-        c.execute("SELECT symbol, position FROM paper_state WHERE position != 0")
+        c.execute("SELECT symbol, position FROM live_state WHERE position != 0")
         for sym, pos in c.fetchall():
             running_positions.append(f"  {'🟢' if pos==1 else '🔴'} {sym}: {'LONG' if pos==1 else 'SHORT'}")
 
         msg = (
-            f"📊 *Mimia Paper Trade Report*\n"
+            f"📊 *Mimia Live Trade Report*\n"
             f"`{now}`\n\n"
             f"*Portfolio*\n"
             f"  Capital: `${capital:.2f}` | Peak: `${peak_capital:.2f}`\n"
@@ -987,7 +990,7 @@ class PaperTrader:
             f"*This Run*\n"
             f"  Trades opened: `{opened}` | closed: `{closed}`\n"
             f"---\n"
-            f"`mimia quant • paper trading`"
+            f"`mimia quant • live trading`"
         )
 
         if len(msg) > 4096:
@@ -998,7 +1001,7 @@ class PaperTrader:
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
 def show_status():
-    """Show current paper trading status."""
+    """Show current live trading status."""
     init_db()
     conn = sqlite3.connect(str(DB_PATH))
 
@@ -1007,7 +1010,7 @@ def show_status():
     pnl_pct = pnl / INITIAL_CAPITAL * 100
     dd = (peak_capital - capital) / peak_capital * 100 if peak_capital > 0 else 0
 
-    print(f"\n📊 Paper Trading Status")
+    print(f"\n📊 Live Trading Status")
     print(f"{'='*50}")
     print(f"  Capital: ${capital:.2f}")
     print(f"  Peak:    ${peak_capital:.2f}")
@@ -1016,27 +1019,27 @@ def show_status():
 
     # Trades summary
     c = conn.cursor()
-    c.execute("SELECT COUNT(*), SUM(pnl_net) FROM paper_trades")
+    c.execute("SELECT COUNT(*), SUM(pnl_net) FROM live_trades")
     cnt, total_pnl = c.fetchone()
     total_pnl = total_pnl or 0
     print(f"\n  Total Trades: {cnt}")
     print(f"  Cumulative PnL: ${total_pnl:.2f}")
 
     if cnt > 0:
-        c.execute("SELECT COUNT(*), SUM(pnl_net) FROM paper_trades WHERE pnl_net > 0")
+        c.execute("SELECT COUNT(*), SUM(pnl_net) FROM live_trades WHERE pnl_net > 0")
         wins, win_pnl = c.fetchone()
         win_pnl = win_pnl or 0
         win_rate = wins / cnt * 100
         print(f"  Wins: {wins}/{cnt} ({win_rate:.1f}%)")
 
-        c.execute("SELECT SUM(pnl_net) FROM paper_trades WHERE pnl_net < 0")
+        c.execute("SELECT SUM(pnl_net) FROM live_trades WHERE pnl_net < 0")
         loss_pnl = c.fetchone()[0] or 0
         pf = win_pnl / abs(loss_pnl) if loss_pnl != 0 else float('inf')
         print(f"  Profit Factor: {pf:.2f}")
 
     # Open positions
     print(f"\n  Open Positions:")
-    c.execute("SELECT symbol, position, entry_price, hold_remaining FROM paper_state WHERE position != 0")
+    c.execute("SELECT symbol, position, entry_price, hold_remaining FROM live_state WHERE position != 0")
     positions = c.fetchall()
     if positions:
         for sym, pos, price, hold in positions:
@@ -1047,7 +1050,7 @@ def show_status():
 
     # Last runs
     print(f"\n  Last 5 Runs:")
-    c.execute("SELECT timestamp, signals_generated, trades_opened, trades_closed FROM paper_runs ORDER BY id DESC LIMIT 5")
+    c.execute("SELECT timestamp, signals_generated, trades_opened, trades_closed FROM live_runs ORDER BY id DESC LIMIT 5")
     for ts, sigs, opened, closed in c.fetchall():
         t = datetime.fromtimestamp(ts / 1000).strftime('%m-%d %H:%M')
         print(f"    {t}: {sigs} signals, {opened} opened, {closed} closed")
@@ -1055,10 +1058,10 @@ def show_status():
     conn.close()
 
 
-def show_report():
+def show_report(testnet: bool = True):
     """Generate and send a full daily report."""
     init_db()
-    pt = PaperTrader(report=True)
+    pt = LiveTrader(report=True, testnet=testnet)
 
     capital, peak_capital = get_capital(pt.conn)
     dd = (peak_capital - capital) / peak_capital * 100 if peak_capital > 0 else 0
@@ -1069,7 +1072,7 @@ def show_report():
     c.execute("""
         SELECT symbol, direction, entry_time, exit_time, entry_price, exit_price,
                pnl_net, pnl_pct, entry_proba
-        FROM paper_trades
+        FROM live_trades
         WHERE entry_time >= ?
         ORDER BY entry_time DESC
     """, (today_start,))
@@ -1089,15 +1092,15 @@ def show_report():
 
     # Weekly stats
     week_start = int((datetime.utcnow() - timedelta(days=7)).timestamp() * 1000)
-    c.execute("SELECT COUNT(*), SUM(pnl_net) FROM paper_trades WHERE entry_time >= ?", (week_start,))
+    c.execute("SELECT COUNT(*), SUM(pnl_net) FROM live_trades WHERE entry_time >= ?", (week_start,))
     week_cnt, week_pnl = c.fetchone()
     week_pnl = week_pnl or 0
-    c.execute("SELECT COUNT(*) FROM paper_trades WHERE entry_time >= ? AND pnl_net > 0", (week_start,))
+    c.execute("SELECT COUNT(*) FROM live_trades WHERE entry_time >= ? AND pnl_net > 0", (week_start,))
     week_wins = c.fetchone()[0] or 0
     week_wr = week_wins / week_cnt * 100 if week_cnt > 0 else 0
 
     # Open positions
-    c.execute("SELECT symbol, position, entry_price FROM paper_state WHERE position != 0")
+    c.execute("SELECT symbol, position, entry_price FROM live_state WHERE position != 0")
     open_pos = c.fetchall()
 
     msg = (
@@ -1124,7 +1127,7 @@ def show_report():
     # Best/worst symbol
     c.execute("""
         SELECT symbol, COUNT(*) as cnt, SUM(pnl_net) as pnl
-        FROM paper_trades GROUP BY symbol ORDER BY pnl DESC
+        FROM live_trades GROUP BY symbol ORDER BY pnl DESC
     """)
     symbol_pnl = c.fetchall()
     if symbol_pnl:
@@ -1138,15 +1141,15 @@ def show_report():
 
 
 def reset_state():
-    """Reset all paper trading state (positions, but keep trade history)."""
+    """Reset all live trading state (positions, but keep trade history)."""
     init_db()
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
-    c.execute("UPDATE paper_state SET position=0, entry_price=0, entry_time=0, "
+    c.execute("UPDATE live_state SET position=0, entry_price=0, entry_time=0, "
               "entry_proba=0, hold_remaining=0, cooldown_remaining=0, qty=0")
-    c.execute("DELETE FROM paper_signals")
-    c.execute("DELETE FROM paper_capital")
-    c.execute("INSERT INTO paper_capital (timestamp, capital, peak_capital) VALUES (?, ?, ?)",
+    c.execute("DELETE FROM live_signals")
+    c.execute("DELETE FROM live_capital")
+    c.execute("INSERT INTO live_capital (timestamp, capital, peak_capital) VALUES (?, ?, ?)",
               (int(time.time() * 1000), INITIAL_CAPITAL, INITIAL_CAPITAL))
     conn.commit()
     conn.close()
@@ -1155,11 +1158,17 @@ def reset_state():
 
 # ─── Main ───────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Mimia Paper Trading Engine')
+    parser = argparse.ArgumentParser(description='Mimia Live Trading Engine')
     parser.add_argument('--init', action='store_true', help='Initialize database')
     parser.add_argument('--status', action='store_true', help='Show current status')
     parser.add_argument('--report', action='store_true', help='Send daily report')
     parser.add_argument('--reset', action='store_true', help='Reset trading state')
+    # Network mode: testnet (default) or mainnet
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument('--testnet', action='store_true', default=False,
+                           help='Use Binance testnet (default)')
+    mode_group.add_argument('--mainnet', action='store_true', default=False,
+                           help='⚠️ Use Binance MAINNET — real funds at risk!')
     args = parser.parse_args()
 
     if args.init:
@@ -1168,12 +1177,18 @@ if __name__ == '__main__':
     elif args.status:
         show_status()
     elif args.report:
-        show_report()
+        show_report(testnet=not args.mainnet)
     elif args.reset:
         reset_state()
     else:
-        # Run one paper trading cycle
-        pt = PaperTrader()
+        # Determine testnet mode: --mainnet overrides default
+        use_testnet = not args.mainnet
+        network_label = "TESTNET" if use_testnet else "⚠️ MAINNET (REAL FUNDS) ⚠️"
+        print(f"\n{'='*60}")
+        print(f"  Mode: {network_label}")
+        print(f"{'='*60}")
+        # Run one live trading cycle
+        pt = LiveTrader(testnet=use_testnet)
         try:
             pt.run()
         except KeyboardInterrupt:

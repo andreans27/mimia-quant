@@ -7,7 +7,6 @@ __pycache__/
 # C extensions
 *.c
 *.o
-*.so
 
 # Distribution / packaging
 .Python
@@ -70,6 +69,9 @@ npm-debug.log*
 *.sqlite
 *.sqlite3
 
+# PID files
+*.pid
+
 # Local configuration (secrets)
 config/local.yaml
 config/secrets.yaml
@@ -103,9 +105,6 @@ temp/
 # Prometheus metrics
 metrics/
 
-# Coverage reports
-htmlcov/
-
 # Large data artifacts (not for version control)
 data/ml_cache/
 data/ml_models/
@@ -115,11 +114,6 @@ data/market_data/
 data/*.json
 data/*.log
 data/*.txt
-scripts/__pycache__/
-scripts/*.pyc
-*.parquet
-*.db
-models/
 
 # Debug scripts
 debug_*.py

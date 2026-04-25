@@ -454,7 +454,7 @@ def _fetch_all_klines(client, symbol: str, interval: str, start_ms: int, end_ms:
             else:
                 try:
                     last_time = last.open_time if hasattr(last, 'open_time') else last['open_time']
-                except:
+                except Exception:
                     break
             current_start = int(last_time) + 1
             if len(batch) < max_per_request:

@@ -301,8 +301,8 @@ def create_binance_http_client(
 if __name__ == "__main__":
     # Test the client
     import os
-    os.environ["BINANCE_TESTNET_API_KEY"] = "D3Wbkd8THmr8ZLGfB4NGtTVBlJcorYFeOCrCOltebRcPDIeHVekDssJFogzzaGX4"
-    os.environ["BINANCE_TESTNET_API_SECRET"] = "lyAK3TKEatiRnQvwLV0ixBkfYPm1surlxythQ7j7pjZdWP2fcK9JHPtTPMOmTcoAx"
+    os.environ.setdefault("BINANCE_TESTNET_API_KEY", os.getenv("BINANCE_TESTNET_API_KEY", ""))
+    os.environ.setdefault("BINANCE_TESTNET_API_SECRET", os.getenv("BINANCE_TESTNET_API_SECRET", ""))
     
     client = BinanceHTTPClient(testnet=True)
     print("Base URL:", client.base_url)

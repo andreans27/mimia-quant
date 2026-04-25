@@ -8,7 +8,7 @@ except ImportError as e:
     print(f"yaml import FAILED: {e}")
     sys.exit(1)
 
-for path in ("config/config.yaml", "configs/strategies.yaml"):
+for path in ("config/config.yaml", "config/strategies.yaml"):
     with open(path) as f:
         data = yaml.safe_load(f)
         print(f"  ✓ {path} loaded")
@@ -17,7 +17,7 @@ config = yaml.safe_load(open("config/config.yaml"))
 name = config.get("system", {}).get("name", "UNKNOWN")
 print(f"  System: {name}")
 
-strategies = yaml.safe_load(open("configs/strategies.yaml"))
+strategies = yaml.safe_load(open("config/strategies.yaml"))
 keys = list(strategies.get("strategies", {}).keys())
 print(f"  Strategies ({len(keys)}): {keys}")
 
