@@ -226,11 +226,33 @@ class LiveTrader:
                     continue
                 direction = 1 if pos_amt > 0 else -1
                 qty = abs(pos_amt)
-                entry_price = abs(notional / pos_amt) if pos_amt != 0 else 0
-                # Check existing DB entry_time to calculate real hold_remaining
-                c.execute("SELECT entry_time FROM live_state WHERE symbol=?", (sym,))
-                existing_entry = c.fetchone()
-                db_entry_time = existing_entry[0] if existing_entry and existing_entry[0] else 0
+                # PRESERVE original entry_price from DB (set at trade entry via get_order polling)
+                # BUG FIX: notional/pos_amt = CURRENT mark price, NOT entry price!
+                # Only recalculate if DB has no entry yet (fresh start).
+                c.execute("SELECT entry_time, entry_price FROM live_state WHERE symbol=?", (sym,))
+                existing_row = c.fetchone()
+                db_entry_time = existing_row[0] if existing_row and existing_row[0] else 0
+                db_entry_price = existing_row[1] if existing_row and existing_row[1] > 0 else 0
+
+                entry_price = 0
+                if db_entry_price > 0:
+                    entry_price = db_entry_price  # Preserve original from trade execution
+                else:
+                    # Fresh start — use entry_price from account_information_v2 (correct field)
+                    try:
+                        acct = client._call('account_information_v2')
+                        for pos in acct.positions:
+                            if getattr(pos, 'symbol', '') == sym:
+                                ep = float(getattr(pos, 'entry_price', 0) or 0)
+                                if ep > 0:
+                                    entry_price = ep
+                                    break
+                    except Exception:
+                        pass
+                if entry_price <= 0:
+                    # Last-resort fallback (notional = mark-price based, but better than zero)
+                    entry_price = abs(notional / pos_amt) if pos_amt != 0 else 0
+
                 entry_time = db_entry_time if db_entry_time > 0 else int(time.time() * 1000)
                 hold = self._calc_hold_remaining(entry_time)
                 # Update DB state to match Binance
