@@ -278,8 +278,8 @@ def compare_with_production(symbol: str, new_metrics: dict,
     if not old:
         new_wr = new_metrics.get('wr', 0)
         new_pf = new_metrics.get('pf', 0)
-        # Minimum quality gate — even first-time training must meet standards
-        if new_wr < 70.0 or new_pf < 2.0:
+        # Realistic quality gate for first-time training
+        if new_wr < 55.0 or new_pf < 1.5:
             decision['should_deploy'] = False
             decision['reason'] = f'quality_gate_failed_wr_{new_wr:.1f}%_pf_{new_pf:.2f}'
             return decision
@@ -321,7 +321,7 @@ def compare_with_production(symbol: str, new_metrics: dict,
     
     # Global quality gate: never deploy models below minimum standards
     if decision['should_deploy']:
-        if new_wr < 70.0 or new_pf < 2.0:
+        if new_wr < 55.0 or new_pf < 1.5:
             decision['should_deploy'] = False
             decision['reason'] = f'quality_gate_wr_{new_wr:.1f}%_pf_{new_pf:.2f}'
     
@@ -329,21 +329,39 @@ def compare_with_production(symbol: str, new_metrics: dict,
 
 
 def save_status(symbol: str, metrics: dict, deployed: bool = False):
-    """Save latest metrics to retrain status file."""
+    """Save latest metrics to retrain status file.
+
+    Tracks retrain count per calendar week to enforce MAX_RETRAIN_PER_WEEK.
+    Resets weekly counter when ISO week number changes.
+    """
     status_file = STATUS_FILE
     if status_file.exists():
         with open(status_file) as f:
             data = json.load(f)
     else:
         data = {'symbols': {}, 'last_run': None, 'runs': []}
-    
+
+    now = datetime.now()
+    current_iso_week = f"{now.isocalendar()[0]}-W{now.isocalendar()[1]}"  # "2026-W17"
+
+    # Get existing symbol data to preserve weekly counter
+    existing = data['symbols'].get(symbol, {})
+    last_week = existing.get('iso_week', '')
+
+    # Reset weekly retrain counter if week changed
+    if last_week == current_iso_week:
+        retrains_this_week = existing.get('retrains_this_week', 0) + 1
+    else:
+        retrains_this_week = 1
+
     data['symbols'][symbol] = metrics
-    data['symbols'][symbol]['last_retrained'] = datetime.now().isoformat()
+    data['symbols'][symbol]['last_retrained'] = now.isoformat()
     data['symbols'][symbol]['deployed'] = deployed
-    if deployed:
-        data['symbols'][symbol]['deployed_at'] = datetime.now().isoformat()
-    data['last_run'] = datetime.now().isoformat()
-    
+    data['symbols'][symbol]['deployed_at'] = now.isoformat() if deployed else existing.get('deployed_at')
+    data['symbols'][symbol]['retrains_this_week'] = retrains_this_week
+    data['symbols'][symbol]['iso_week'] = current_iso_week
+    data['last_run'] = now.isoformat()
+
     with open(status_file, 'w') as f:
         json.dump(data, f, indent=2, default=str)
 

@@ -11,9 +11,11 @@ Decision Matrix per Symbol (3 possible actions):
   ┌─────────────────────────────────────────────────────┬────────────────────┐
   │ Condition                                            │ Action             │
   ├─────────────────────────────────────────────────────┼────────────────────┤
-  │ WR < 60%  OR  PF < 2.0  OR  signal drop > 20%       │ 🟥 RETRAIN (force) │
-  │ WR 60-68%  OR  PF 2.0-3.0  OR  stable edge          │ 🟡 ADJUST thresh   │
-  │ WR ≥ 70%  AND  PF ≥ 3.0  AND  no trend decay         │ 🟢 SKIP (edge OK)  │
+  │ WR < 50%  OR  PF < 1.2                               │ 🟥 RETRAIN (urgent)│
+  │ WR 50-55%  OR  PF 1.2-1.5  + interval up             │ 🟡 RETRAIN (decay) │
+  │ WR 55-60%  OR  PF 1.5-2.0  + interval up             │ 🟡 RETRAIN (time)  │
+  │ WR ≥ 60%  AND  PF ≥ 2.0                               │ 🟢 SKIP (edge OK)  │
+  │ Weekly cap exceeded (1x/symbol/week)                  │ 🟢 SKIP (capped)   │
   └─────────────────────────────────────────────────────┴────────────────────┘
 
 This script is called by Hermes cron system, NOT by the system cron daemon.
@@ -54,15 +56,21 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Per-cycle limits
 MAX_RETRAIN_PER_CYCLE = 2     # at most 2 symbols per hour
-RETRAIN_INTERVAL_HOURS = 24   # don't retrain same symbol more than once/day
+RETRAIN_INTERVAL_HOURS = 72   # minimum 3 days between retrains (was 24)
+MIN_INTERVAL_URGENT_HOURS = 24 # minimum 1 day even for urgent (WR < 55%)
+MAX_RETRAIN_PER_WEEK = 1      # max 1x per symbol per week (was unlimited)
 FULL_CYCLE_HOURS = 12         # complete full cycle over all symbols in 12 hours
 
-# Signal quality thresholds
-WR_BACKTEST_BASELINE = 0.70   # backtest target WR (70% from SOUL.md)
-PF_BACKTEST_BASELINE = 3.0    # backtest target PF
-WR_FORCE_RETRAIN = 0.60       # if live WR falls below this → force retrain
-PF_FORCE_RETRAIN = 2.0        # if live PF falls below this → force retrain
-DECAY_WARNING_PCT = 0.20      # if live WR falls 20% below backtest avg → force retrain
+# Signal quality thresholds — REALISTIC for live trading
+# (Backtest WR 70% will realistically degrade to 55-60% live)
+WR_GREEN = 0.60               # ✅ Edge OK: live WR >= 60%
+WR_YELLOW = 0.55              # 🟡 Watch zone: WR 55-60%, stable edge
+WR_RED = 0.50                 # 🔴 Force retrain: WR < 50%
+
+PF_GREEN = 2.0                # ✅ Edge OK: live PF >= 2.0
+PF_YELLOW = 1.5               # 🟡 Watch zone: PF 1.5-2.0
+PF_RED = 1.2                  # 🔴 Force retrain: PF < 1.2
+
 MIN_TRADES_FOR_STATS = 30     # minimum ALL-TIME trades before quality stats are meaningful
 MIN_TRADES_CURRENT_MODEL = 20 # minimum trades from CURRENT deployed model before triggering retrain
 
@@ -215,60 +223,80 @@ def analyze_signal_quality(symbol: str, status_data: dict) -> dict:
         # Can't filter — fall back to all-time data but be conservative
         pass  # continue with all-time data below
 
-    # ── Force retrain conditions — signal decay detected ──
-    stats_source = n_trades_current
+    # ── Helper: hours since last retrain ──
+    def _hours_since_retrain(last_retrained_str):
+        try:
+            if not last_retrained_str:
+                return 999999
+            last_dt = datetime.fromisoformat(last_retrained_str)
+            return (datetime.now() - last_dt).total_seconds() / 3600
+        except Exception:
+            return 999999
+
+    hours_since = _hours_since_retrain(last_retrained)
+    retrains_this_week = entry.get('retrains_this_week', 0)
+
+    # ── Decide which stats to use ──
     test_wr = live_wr if n_trades_current >= MIN_TRADES_CURRENT_MODEL else live_all['wr']
     test_pf = live_pf if n_trades_current >= MIN_TRADES_CURRENT_MODEL else live_all['pf']
     test_nt = n_trades_current if n_trades_current >= MIN_TRADES_CURRENT_MODEL else n_trades_all
-    
-    if test_wr < WR_FORCE_RETRAIN and test_nt >= MIN_TRADES_FOR_STATS:
-        result['action'] = 'RETRAIN'
-        result['reason'] = f'WR {test_wr:.0%} < {WR_FORCE_RETRAIN:.0%} threshold ({test_nt} tr)'
-        result['priority'] = 1
-        return result
 
-    if test_pf < PF_FORCE_RETRAIN and test_nt >= MIN_TRADES_FOR_STATS:
-        result['action'] = 'RETRAIN'
-        result['reason'] = f'PF {test_pf:.2f} < {PF_FORCE_RETRAIN:.1f} threshold ({test_nt} tr)'
-        result['priority'] = 1
-        return result
+    # ── Force retrain: WR < 50% or PF < 1.2 ──
+    # (model genuinely broken — urgent)
+    if (test_wr < WR_RED or test_pf < PF_RED) and test_nt >= MIN_TRADES_FOR_STATS:
+        if hours_since >= MIN_INTERVAL_URGENT_HOURS:
+            result['action'] = 'RETRAIN'
+            result['reason'] = f'urgent: WR {test_wr:.0%} PF {test_pf:.2f} ({test_nt} tr)'
+            result['priority'] = 1
+            return result
+        else:
+            result['action'] = 'SKIP'
+            result['reason'] = f'urgent but cooldown ({hours_since:.0f}/{MIN_INTERVAL_URGENT_HOURS}h)'
+            result['priority'] = 2
+            return result
 
-    decay_pct = (bt_wr - test_wr) / max(bt_wr, 0.01)
-    if bt_wr > 0.5 and decay_pct > DECAY_WARNING_PCT and test_nt >= MIN_TRADES_FOR_STATS:
-        result['action'] = 'RETRAIN'
-        result['reason'] = f'signal decay {decay_pct:.0%} > {DECAY_WARNING_PCT:.0%} (BT {bt_wr:.0%} → Live {test_wr:.0%})'
-        result['priority'] = 2
-        return result
+    # ── Yellow zone: WR 50-55% or PF 1.2-1.5 ──
+    # (model degrading — retrain on schedule)
+    if (test_wr < WR_YELLOW or test_pf < PF_YELLOW) and test_nt >= MIN_TRADES_FOR_STATS:
+        if hours_since >= RETRAIN_INTERVAL_HOURS and retrains_this_week < MAX_RETRAIN_PER_WEEK:
+            result['action'] = 'RETRAIN'
+            result['reason'] = f'deteriorating: WR {test_wr:.0%} PF {test_pf:.2f} ({test_nt} tr, {hours_since:.0f}h)'
+            result['priority'] = 3
+            return result
+        elif hours_since >= RETRAIN_INTERVAL_HOURS:
+            result['action'] = 'SKIP'
+            result['reason'] = f'deteriorating but weekly cap hit ({retrains_this_week}/{MAX_RETRAIN_PER_WEEK})'
+            result['priority'] = 4
+            return result
+        else:
+            result['action'] = 'SKIP'
+            result['reason'] = f'slightly below: WR {test_wr:.0%} PF {test_pf:.2f} (next retrain in {RETRAIN_INTERVAL_HOURS-hours_since:.0f}h)'
+            result['priority'] = 4
+            return result
 
-    # ── Edge OK — skip if time-based interval not exceeded ──
-    if test_wr >= WR_BACKTEST_BASELINE and test_pf >= PF_BACKTEST_BASELINE:
+    # ── Green zone: WR >= 60% AND PF >= 2.0 ──
+    if test_wr >= WR_GREEN and test_pf >= PF_GREEN:
         result['action'] = 'SKIP'
         result['reason'] = f'edge OK: WR {test_wr:.0%} PF {test_pf:.2f} ({test_nt} tr)'
         result['priority'] = 5
         return result
 
-    # ── Acceptable region — keep but schedule ──
-    if test_wr >= 0.60 and test_pf >= 2.0:
-        try:
-            last_dt = datetime.fromisoformat(last_retrained)
-            hours_since = (datetime.now() - last_dt).total_seconds() / 3600
-            if hours_since >= RETRAIN_INTERVAL_HOURS:
-                result['action'] = 'RETRAIN'
-                result['reason'] = f'time-based: {hours_since:.0f}h since last retrain (WR {test_wr:.0%} PF {test_pf:.2f})'
-                result['priority'] = 3
-            else:
-                result['action'] = 'SKIP'
-                result['reason'] = f'stable edge: WR {test_wr:.0%} PF {test_pf:.2f} (next {RETRAIN_INTERVAL_HOURS-hours_since:.0f}h)'
-                result['priority'] = 4
-        except Exception:
+    # ── Stable edge zone: WR 55-60%, PF 1.5-2.0 ──
+    if test_wr >= WR_YELLOW and test_pf >= PF_YELLOW:
+        if hours_since >= RETRAIN_INTERVAL_HOURS and retrains_this_week < MAX_RETRAIN_PER_WEEK:
             result['action'] = 'RETRAIN'
-            result['reason'] = f'stable edge, last_retrained unparseable'
+            result['reason'] = f'time-based: {hours_since:.0f}h since last (WR {test_wr:.0%} PF {test_pf:.2f})'
             result['priority'] = 3
-        return result
+            return result
+        else:
+            result['action'] = 'SKIP'
+            result['reason'] = f'stable: WR {test_wr:.0%} PF {test_pf:.2f} (next in {RETRAIN_INTERVAL_HOURS-hours_since:.0f}h)'
+            result['priority'] = 4
+            return result
 
-    # ── Default: time-based ──
+    # ── Fallback ──
     result['action'] = 'SKIP'
-    result['reason'] = f'default (insufficient signal data)'
+    result['reason'] = f'default (WR {test_wr:.0%} PF {test_pf:.2f}, {test_nt} tr)'
     result['priority'] = 6
     return result
 

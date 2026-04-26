@@ -39,7 +39,7 @@
 - **372 engineered features** — price action, volatility, volume profile, microstructure, and regime indicators
 - **Threshold‑optimized entries** — grid scan over 0.50–0.90 for optimal Sharpe/WR/DD tradeoff per symbol
 - **Overfitting controls** — feature subsampling, strong L1/L2 regularization (α=1.0, λ=3.0), walk‑forward validation, independent OOS sets
-- **Automated retraining pipeline** — hourly cron job monitors edge decay and triggers retraining when performance degrades
+- **Automated retraining pipeline** — hourly cron job monitors edge decay (realistic thresholds: WR < 55% or PF < 1.5 triggers urgent retrain, 72h minimum interval, weekly cap 1x/symbol)
 
 ### Bidirectional Trading
 - No directional bias — evaluates long and short setups with identical rigor
@@ -152,6 +152,44 @@ Optimal Threshold Selected → Live Trade
 - **Feature Groups**: price action (120), volatility (60), volume (60), microstructure (72), regime (60)
 - **Voting Pipeline**: all 25 models vote, probability threshold 0.60 for entry
 
+### Automated Retraining (Every Hour)
+
+The system monitors live signal quality every hour and decides whether to retrain per symbol:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Decision Matrix — REALISTIC live thresholds              │
+├─────────────────────────────────────┬────────────────────┤
+│  Live WR ≥ 60% AND PF ≥ 2.0        │ 🟢 SKIP (edge OK)  │
+│  WR 55-60% OR PF 1.5-2.0           │ 🟡 RETRAIN (time)  │
+│                                      │   (every 72h)     │
+│  WR 50-55% OR PF 1.2-1.5           │ 🟡 RETRAIN (decay) │
+│  WR < 50% OR PF < 1.2              │ 🔴 RETRAIN (urgent)│
+│  Weekly cap: 1x/symbol/week        │ 🟢 SKIP (capped)   │
+└─────────────────────────────────────┴────────────────────┘
+```
+
+**Why realistic?** Backtest WR of 70% typically degrades to 55-60% in live trading
+due to market regime shifts and adversarial adaptation. Thresholds calibrated for
+sustainable live performance, not aspirational backtest numbers.
+
+**Safeguards:**
+- Minimum 20 trades from current model before evaluation
+- Minimum 72h between retrains (24h for urgent WR < 50%)
+- Weekly cap: 1 retrain per symbol per week
+- Pre-deploy validation: new model must pass quality gate (WR ≥ 55%, PF ≥ 1.5)
+- Auto-rollback: if new model fails, old model is restored from backup
+
+### Trade History Integrity
+
+The engine includes three layers of trade history protection:
+
+| Feature | What It Fixes | When Run |
+|---------|--------------|----------|
+| `_close_stale_position()` | Daemon crash mid-trade — logs exit with real Binance fill data instead of silently resetting | On stale position detection |
+| `_verify_position_integrity()` | Position closed on Binance mid-cycle — catches inconsistency and logs trade | Every 5-min daemon cycle |
+| `_sync_trade_history()` | Missing trades from previous runs — pulls last 7 days of Binance fills, groups by entry/exit, backfills gaps | Once per daemon startup |
+
 ### Performance (Backtest — Top Retrained Pairs)
 
 | Symbol | Win Rate | Profit Factor | Monthly Return | Max DD (OOS) |
@@ -213,8 +251,9 @@ bash scripts/trading/live_trader_daemon.sh --testnet
 # Runs autonomously every 5 minutes
 ```
 
-A separate cron job (`scripts/operations/cron_hourly.py`) monitors model performance
-and triggers retraining — will transition to daily once stable.
+A separate cron job (`scripts/operations/cron_hourly.py`) monitors live model performance
+hourly with realistic thresholds (WR ≥ 60% green, < 50% urgent) and enforces a 72h
+minimum retrain interval plus weekly cap of 1 retrain per symbol.
 
 ---
 
