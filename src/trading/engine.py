@@ -142,18 +142,37 @@ class LiveTrader:
                 # Position is legitimately open on Binance — keep it
                 keep_count += 1
                 bp = binance_positions[sym]
-                # Check existing DB entry_time to calculate real hold_remaining
-                c.execute("SELECT entry_time FROM live_state WHERE symbol=?", (sym,))
+                # Check existing DB entry_time AND entry_price 
+                c.execute("SELECT entry_time, entry_price FROM live_state WHERE symbol=?", (sym,))
                 existing_entry = c.fetchone()
                 db_entry_time = existing_entry[0] if existing_entry and existing_entry[0] else 0
+                db_entry_price = existing_entry[1] if existing_entry and existing_entry[1] > 0 else 0
                 entry_time = db_entry_time if db_entry_time > 0 else int(time.time() * 1000)
                 hold = self._calc_hold_remaining(entry_time)
+                # PRESERVE original entry_price from DB — don't use bp['entry_price'] 
+                # (which is notional/pos_amt = CURRENT mark price, NOT entry price)
+                entry_price = db_entry_price
+                if entry_price <= 0:
+                    # Fallback: use account_information_v2 which has REAL entry_price
+                    try:
+                        acct = client._call('account_information_v2')
+                        for pos in acct.positions:
+                            if getattr(pos, 'symbol', '') == sym:
+                                ep = float(getattr(pos, 'entry_price', 0) or 0)
+                                if ep > 0:
+                                    entry_price = ep
+                                    break
+                    except Exception:
+                        pass
+                if entry_price <= 0:
+                    # Last-resort: use bp['entry_price'] (notional/amt = mark price)
+                    entry_price = bp['entry_price']
                 c.execute("""
                     UPDATE live_state
                     SET position=?, qty=?, entry_price=?, entry_time=?,
                         hold_remaining=?, cooldown_remaining=0
                     WHERE symbol=?
-                """, (bp['direction'], bp['qty'], bp['entry_price'],
+                """, (bp['direction'], bp['qty'], entry_price,
                       entry_time, hold, sym))
             else:
                 # Position exists in DB but NOT on Binance — reset it
