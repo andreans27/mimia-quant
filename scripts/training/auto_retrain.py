@@ -55,6 +55,12 @@ TFS = {'full': [], 'm15': ['15m'], 'm30': ['30m'], 'h1': ['1h'], 'h4': ['4h']}
 
 DAYS_DATA = 130
 WARMUP_BARS = 200
+
+# Symbol mapping: Futures symbol → Spot symbol for data fetch.
+# Some tokens use "1000" prefix on Futures but not on Spot (e.g. 1000PEPEUSDT = PEPEUSDT).
+SPOT_SYMBOL_MAP = {
+    '1000PEPEUSDT': 'PEPEUSDT',
+}
 TRAIN_SPLIT = 0.80  # 80% train, 20% OOS
 IMPROVEMENT_THRESHOLD = 0.02  # 2% F1 improvement to auto-deploy
 
@@ -73,16 +79,18 @@ def status(msg: str, symbol: str = ""):
 def fetch_ohlcv(symbol: str, days: int = DAYS_DATA) -> pd.DataFrame:
     """Fetch 5m OHLCV from public Binance API."""
     import requests
+    # Map Futures symbol → Spot symbol if needed (e.g. 1000PEPEUSDT → PEPEUSDT)
+    spot_symbol = SPOT_SYMBOL_MAP.get(symbol, symbol)
     end = datetime.now()
     start = end - timedelta(days=days)
     limit = 1000
     all_bars = []
     cur = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
-    
+
     while cur < end_ms:
         url = "https://api.binance.com/api/v3/klines"
-        params = {'symbol': symbol, 'interval': '5m', 'limit': limit, 'startTime': cur}
+        params = {'symbol': spot_symbol, 'interval': '5m', 'limit': limit, 'startTime': cur}
         try:
             resp = requests.get(url, params=params, timeout=30)
             resp.raise_for_status()
