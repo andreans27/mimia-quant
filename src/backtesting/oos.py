@@ -50,7 +50,7 @@ def fetch_5m_ohlcv_range(symbol, start_time, end_time):
     all_bars = []
     last_ts = start_ms
     while last_ts < end_ms:
-        url = "https://api.binance.com/api/v3/klines"
+        url = "https://fapi.binance.com/fapi/v1/klines"
         params = {
             'symbol': symbol, 'interval': '5m', 'limit': limit,
             'startTime': last_ts, 'endTime': end_ms

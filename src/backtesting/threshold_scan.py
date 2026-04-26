@@ -28,28 +28,15 @@ SLIPPAGE = 0.0005
 INITIAL_CAPITAL = 5000.0
 
 
-_SPOT_SYMBOL_MAP = {
-    '1000PEPEUSDT': 'PEPEUSDT',
-    '1000BONKUSDT': 'BONKUSDT',
-    '1000FLOKIUSDT': 'FLOKIUSDT',
-    '1000SHIBUSDT': 'SHIBUSDT',
-}
-
-def _spot_symbol(symbol):
-    """Map Futures 1000x symbol to Spot symbol."""
-    return _SPOT_SYMBOL_MAP.get(symbol, symbol)
-
-
 def fetch_ohlcv(symbol, start_time, end_time):
-    """5m OHLCV from Binance public API."""
-    symbol = _spot_symbol(symbol)  # handle 1000x prefixed symbols
+    """5m OHLCV from Binance Futures API."""
     start_ms = int(start_time.timestamp() * 1000)
     end_ms = int(end_time.timestamp() * 1000)
     all_bars, last_ts = [], start_ms
     while last_ts < end_ms:
         params = {'symbol': symbol, 'interval': '5m', 'limit': 1000,
                   'startTime': last_ts, 'endTime': end_ms}
-        r = requests.get("https://api.binance.com/api/v3/klines", params=params, timeout=30)
+        r = requests.get("https://fapi.binance.com/fapi/v1/klines", params=params, timeout=30)
         if r.status_code != 200:
             break
         batch = r.json()

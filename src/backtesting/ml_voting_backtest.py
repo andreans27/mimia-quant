@@ -31,12 +31,6 @@ import xgboost as xgb
 CACHE_DIR = Path("data/ml_cache")
 MODEL_DIR = Path("data/ml_models")
 
-# Symbol mapping: Futures symbol → Spot symbol for OHLCV data fetch.
-# Some tokens use "1000" prefix on Futures but not on Spot (e.g. 1000PEPEUSDT = PEPEUSDT).
-SPOT_SYMBOL_MAP = {
-    '1000PEPEUSDT': 'PEPEUSDT',
-}
-
 SYMBOLS = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT',
            'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'UNIUSDT']
 
@@ -46,9 +40,7 @@ INITIAL_CAPITAL = 5000.0
 
 
 def fetch_5m_ohlcv(symbol: str, days: int = 130) -> pd.DataFrame:
-    """Fetch 5m OHLCV from Binance public API."""
-    # Map Futures symbol → Spot symbol if needed (e.g. 1000PEPEUSDT → PEPEUSDT)
-    spot_symbol = SPOT_SYMBOL_MAP.get(symbol, symbol)
+    """Fetch 5m OHLCV from Binance Futures API."""
     end = datetime.now()
     start = end - timedelta(days=days)
     start_ms = int(start.timestamp() * 1000)
@@ -58,9 +50,9 @@ def fetch_5m_ohlcv(symbol: str, days: int = 130) -> pd.DataFrame:
     all_bars = []
     last_ts = start_ms
     while last_ts < end_ms:
-        url = f"https://api.binance.com/api/v3/klines"
+        url = f"https://fapi.binance.com/fapi/v1/klines"
         params = {
-            'symbol': spot_symbol,
+            'symbol': symbol,
             'interval': '5m',
             'limit': limit,
             'startTime': last_ts,

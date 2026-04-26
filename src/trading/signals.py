@@ -45,7 +45,7 @@ class SignalGenerator:
         all_bars = []
         last_ts = start_ms
         while last_ts < end_ms:
-            url = f"https://api.binance.com/api/v3/klines"
+            url = f"https://fapi.binance.com/fapi/v1/klines"
             params = {
                 'symbol': symbol,
                 'interval': '5m',

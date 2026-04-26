@@ -81,7 +81,7 @@ def fetch_ohlcv(symbol, start_time=None, end_time=None, days_back=140):
     while last_ts < end_ms:
         params = {'symbol': symbol, 'interval': '5m', 'limit': 1000,
                   'startTime': last_ts, 'endTime': end_ms}
-        r = requests.get("https://api.binance.com/api/v3/klines", params=params, timeout=30)
+        r = requests.get("https://fapi.binance.com/fapi/v1/klines", params=params, timeout=30)
         if r.status_code != 200:
             break
         batch = r.json()
