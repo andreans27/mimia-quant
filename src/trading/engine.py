@@ -532,8 +532,8 @@ class LiveTrader:
                 order_id = order_resp.get('client_order_id')
             status_code = order_resp.get('status', 'N/A')
 
-            # Poll get_order() for actual fill data (up to 3 attempts, 1s apart)
-            for attempt in range(3):
+            # Poll get_order() for actual fill data (up to 6 attempts, 1s apart)
+            for attempt in range(6):
                 time.sleep(1)
                 try:
                     fill_resp = client.get_order(symbol=symbol, order_id=order_id)
@@ -551,7 +551,26 @@ class LiveTrader:
                     pass
 
             if not order_placed:
-                # Fallback: check position info on Binance
+                # Fallback 1: use account_information_v2 which has REAL entry_price field
+                # (unlike get_position_info() which reports notional = mark_price × amt)
+                time.sleep(1)
+                try:
+                    acct = client._call('account_information_v2')
+                    for pos in acct.positions:
+                        if getattr(pos, 'symbol', '') == symbol.upper():
+                            pos_amt = float(getattr(pos, 'position_amt', 0) or 0)
+                            ep = float(getattr(pos, 'entry_price', 0) or 0)
+                            if abs(pos_amt) > 0.0001 and ep > 0:
+                                entry_price = ep
+                                executed_qty_actual = abs(pos_amt)
+                                order_placed = True
+                                print(f"    📡 ORDER FILLED (acct_info_v2): {side} {symbol} qty={abs(pos_amt):.4f} @ ${ep:.4f}")
+                                break
+                except Exception:
+                    pass
+
+            if not order_placed:
+                # Fallback 2: check position info on Binance (notional = mark×amt, last resort)
                 time.sleep(1)
                 actual_pos = None
                 try:
@@ -571,7 +590,7 @@ class LiveTrader:
                     entry_price = abs(notional / pos_amt) if pos_amt != 0 else price_ref
                     executed_qty_actual = pos_amt
                     order_placed = True
-                    print(f"    📡 ORDER FILLED (position): {side} {symbol} {pos_amt:.4f} @ notional=${notional:.2f} avg=${entry_price:.4f}")
+                    print(f"    ⚠️ ORDER FILLED (position-fallback, notional/amt): {side} {symbol} {pos_amt:.4f} @ ${entry_price:.4f}")
                 else:
                     # Genuinely not filled — use orderbook price
                     entry_price = price_ref * (1 + SLIPPAGE) if direction == 1 else price_ref * (1 - SLIPPAGE)
@@ -629,8 +648,8 @@ class LiveTrader:
             if order_id is None or order_id == '?':
                 order_id = order_resp.get('client_order_id')
 
-            # Poll get_order() for actual fill data (up to 3 attempts, 1s apart)
-            for attempt in range(3):
+            # Poll get_order() for actual fill data (up to 6 attempts, 1s apart)
+            for attempt in range(6):
                 time.sleep(1)
                 try:
                     fill_resp = client.get_order(symbol=symbol, order_id=order_id)
@@ -646,7 +665,24 @@ class LiveTrader:
                     pass
 
             if exit_price is None:
-                # Fallback: check position info
+                # Fallback 1: use account_information_v2 for real entry_price
+                time.sleep(1)
+                try:
+                    acct = client._call('account_information_v2')
+                    for pos in acct.positions:
+                        if getattr(pos, 'symbol', '') == symbol.upper():
+                            remaining = float(getattr(pos, 'position_amt', 0) or 0)
+                            if abs(remaining) < qty * 0.1:
+                                print(f"    📡 EXIT POSITION CLOSED (acct_info_v2): {side} {symbol} remaining={remaining:.4f} (order #{order_id})")
+                                # Use average of entry price ± 0.1% as estimate (position fully closed)
+                                if exit_price is None:
+                                    exit_price = state['entry_price'] * 1.001 if direction == 1 else state['entry_price'] * 0.999
+                                break
+                except Exception:
+                    pass
+
+            if exit_price is None:
+                # Fallback 2: check position info
                 time.sleep(1)
                 try:
                     positions = client.get_position_info()
