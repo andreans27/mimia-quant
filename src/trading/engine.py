@@ -560,7 +560,7 @@ class LiveTrader:
         pnl = capital - INITIAL_CAPITAL
         pnl_pct = pnl / INITIAL_CAPITAL * 100
 
-        # Get recent trade stats
+        # Get realized PnL from closed trades
         c = self.conn.cursor()
         c.execute("""
             SELECT COUNT(*), COALESCE(SUM(CASE WHEN pnl_net > 0 THEN 1 ELSE 0 END), 0),
@@ -570,21 +570,62 @@ class LiveTrader:
         """)
         row = c.fetchone()
         total_trades, wins, total_pnl, gross_profit, gross_loss = row
+        realized_pnl = total_pnl or 0.0
         win_rate = wins / total_trades * 100 if total_trades > 0 else 0
         pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
-        # Get open positions
+        # Calculate unrealized PnL from open positions
+        # capital (total_margin_balance) = wallet_balance + unrealized_pnl
+        # wallet_balance ≈ INITIAL_CAPITAL + realized_pnl
+        wallet_balance = INITIAL_CAPITAL + realized_pnl
+        unrealized_pnl = capital - wallet_balance
+
+        # Get open positions with direction + unrealized PnL from Binance
         running_positions = []
         c.execute("SELECT symbol, position FROM live_state WHERE position != 0")
-        for sym, pos in c.fetchall():
-            running_positions.append(f"  {'🟢' if pos==1 else '🔴'} {sym}: {'LONG' if pos==1 else 'SHORT'}")
+        db_open = {sym: pos for sym, pos in c.fetchall()}
+
+        # Try to get per-position unrealized PnL from Binance
+        pos_unrealized = {}
+        try:
+            client = self._get_client()
+            positions = client.get_position_info()
+            for p in positions:
+                sym = p.get('symbol', '')
+                amt = float(p.get('position_amt', 0) or 0)
+                if sym in db_open and abs(amt) > 0.001:
+                    upnl = float(p.get('unrealized_profit', 0) or 0)
+                    pos_unrealized[sym] = upnl
+        except Exception:
+            pass
+
+        for sym, pos in sorted(db_open.items()):
+            label = 'LONG' if pos == 1 else 'SHORT'
+            icon = '🟢' if pos == 1 else '🔴'
+            upnl = pos_unrealized.get(sym)
+            if upnl is not None:
+                upnl_str = f" `${upnl:+.2f}`" if abs(upnl) >= 0.005 else ""
+                running_positions.append(f"  {icon} {sym}: {label}{upnl_str}")
+            else:
+                running_positions.append(f"  {icon} {sym}: {label}")
 
         msg = (
             f"📊 *Mimia Live Trade Report*\n"
             f"`{now}`\n\n"
             f"*Portfolio*\n"
-            f"  Capital: `${capital:.2f}` | Peak: `${peak_capital:.2f}`\n"
+            f"  Equity: `${capital:.2f}` | Peak: `${peak_capital:.2f}`\n"
             f"  PnL: `${pnl:+.2f}` ({pnl_pct:+.2f}%) | DD: `{dd:.2f}%`\n"
+        )
+
+        # Add realized/unrealized breakdown
+        if unrealized_pnl != 0 or realized_pnl != 0:
+            # Always show realized; only show unrealized when non-trivial
+            msg += (
+                f"  ├ Realized: `${realized_pnl:+.2f}` (closed trades)\n"
+                f"  └ Unrealized: `${unrealized_pnl:+.2f}` (open positions)\n"
+            )
+
+        msg += (
             f"  Win Rate: `{win_rate:.1f}%` | PF: `{pf:.2f}` ({total_trades} trades)\n\n"
         )
 
