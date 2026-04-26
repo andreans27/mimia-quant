@@ -49,8 +49,9 @@ class LiveTrader:
         self.network = "testnet" if testnet else "mainnet"
         self.conn = sqlite3.connect(str(DB_PATH))
         self._signal_gens = {}
-        self.report_mode = report
         self._client = None  # lazy-init
+        self.report_mode = report
+        self._history_synced = False  # runs once per daemon startup
 
     def _get_client(self):
         """Lazy-init Binance client (testnet or mainnet based on self.testnet)."""
@@ -175,9 +176,11 @@ class LiveTrader:
                 """, (bp['direction'], bp['qty'], entry_price,
                       entry_time, hold, sym))
             else:
-                # Position exists in DB but NOT on Binance — reset it
+                # Position exists in DB but NOT on Binance — close it properly
+                # instead of silently resetting (which loses trade history)
                 reset_count += 1
-                print(f"  ⚠️ Stale DB position: {sym} (not on Binance {net}). Resetting...")
+                self._close_stale_position(sym, c)
+                print(f"  ⚠️ Stale DB position: {sym} (not on Binance {net}). Closing & resetting...")
                 c.execute("UPDATE live_state SET position=0, entry_price=0, entry_time=0, entry_proba=0, hold_remaining=0, cooldown_remaining=0, qty=0 WHERE symbol=?", (sym,))
 
         if keep_count > 0:
@@ -193,6 +196,253 @@ class LiveTrader:
             if self._init_leverage(sym):
                 ok += 1
         print(f"  ✅ Leverage 10x set for {ok}/{len(LIVE_SYMBOLS)} symbols")
+
+    def _close_stale_position(self, symbol: str, cursor) -> None:
+        """Close a stale DB position by logging a complete trade with actual Binance fill data.
+
+        Called when a position exists in DB (live_state) but NOT on Binance —
+        instead of silently resetting, we fetch real fill prices from Binance
+        trade history and record the complete trade in live_trades.
+
+        Does NOT modify capital — the position was already resolved on Binance,
+        so PnL is already reflected in the wallet balance. This is purely for
+        historical record-keeping and accurate summary reports.
+        """
+        # 1. Read entry info from DB before reset
+        cursor.execute(
+            "SELECT entry_price, entry_time, entry_proba, qty, position "
+            "FROM live_state WHERE symbol=?", (symbol,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return
+        entry_price, entry_time, entry_proba, qty, direction = row
+        if not qty or qty <= 0 or not entry_price or entry_price <= 0:
+            return  # Nothing meaningful to log
+
+        direction_label = 'LONG' if direction == 1 else 'SHORT'
+        direction_str = 'long' if direction == 1 else 'short'
+
+        # 2. Find actual exit price from Binance account_trade_list
+        exit_price = None
+        exit_time = int(time.time() * 1000)
+        exit_side = "SELL" if direction == 1 else "BUY"
+
+        try:
+            client = self._get_client()
+            fills = client.get_account_trades(symbol, limit=20)
+            for f in fills:
+                if f.get('side') == exit_side:
+                    p = float(f.get('price', 0) or 0)
+                    if p > 0:
+                        exit_price = p
+                        t = int(f.get('time', 0) or 0)
+                        if t > 0:
+                            exit_time = t
+                        print(f"    📡 Stale exit price from Binance trade #{f.get('id')}: ${exit_price:.4f}")
+                        break
+        except Exception as e:
+            print(f"    ⚠️ Could not fetch Binance fills for stale position: {e}")
+
+        # 3. Fallback to orderbook if Binance data unavailable
+        if exit_price is None or exit_price <= 0:
+            try:
+                client = self._get_client()
+                ob = client.get_orderbook_depth(symbol)
+                if direction == 1:
+                    exit_price = float(ob['bids'][0][0]) * (1 - SLIPPAGE)
+                else:
+                    exit_price = float(ob['asks'][0][0]) * (1 + SLIPPAGE)
+                print(f"    📡 Stale exit price from orderbook: ${exit_price:.4f}")
+            except Exception as e:
+                print(f"    ⚠️ Orderbook fallback failed: {e}")
+                exit_price = entry_price * (1.001 if direction == 1 else 0.999)
+                print(f"    📡 Stale exit price estimated: ${exit_price:.4f}")
+
+        # 4. Calculate PnL
+        if direction == 1:
+            raw_pnl = qty * (exit_price - entry_price)
+        else:
+            raw_pnl = qty * (entry_price - exit_price)
+
+        exit_cost = exit_price * qty * TAKER_FEE
+        pnl_net = raw_pnl - exit_cost
+        entry_value = entry_price * qty
+        pnl_pct = pnl_net / entry_value * 100 if entry_value > 0 else 0
+        hold_bars = HOLD_BARS
+
+        # 5. Log the complete trade
+        trade = {
+            'symbol': symbol,
+            'direction': direction_str,
+            'entry_time': entry_time,
+            'exit_time': exit_time,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'qty': qty,
+            'pnl_net': pnl_net,
+            'pnl_pct': pnl_pct,
+            'entry_proba': entry_proba,
+            'hold_bars': hold_bars,
+            'exit_reason': 'system_restart',
+        }
+        log_trade(self.conn, trade)
+
+        pnl_icon = "🟢" if pnl_net > 0 else "🔴"
+        print(f"  {pnl_icon} Stale position CLOSED: {direction_label} {symbol} ${entry_price:.4f} → ${exit_price:.4f} "
+              f"| PnL: ${pnl_net:.2f} ({pnl_pct:+.2f}%) | logged to history")
+
+    def _verify_position_integrity(self, states: Dict) -> None:
+        """Per-cycle check: ensure every in-DB position matches Binance reality.
+
+        If a position is marked as open in DB but not actually on Binance,
+        close it properly (log trade, reset state) instead of attempting
+        a fake exit order later.
+        """
+        try:
+            client = self._get_client()
+            positions_raw = client.get_position_info()
+            open_binance = {}
+            for p in positions_raw:
+                sym = p.get('symbol', '').upper()
+                amt = float(p.get('position_amt', 0))
+                if sym in LIVE_SYMBOLS and abs(amt) > 0.001:
+                    open_binance[sym] = amt
+
+            c = self.conn.cursor()
+            for sym, state in states.items():
+                if state['position'] == 0:
+                    continue
+                amt_on_binance = abs(open_binance.get(sym, 0))
+                if amt_on_binance < 0.001:
+                    print(f"  ⚠️ Integrity: {sym} open in DB but closed on Binance — logging exit")
+                    self._close_stale_position(sym, c)
+                    state['position'] = 0
+                    state['entry_price'] = 0
+                    state['entry_time'] = 0
+                    state['entry_proba'] = 0
+                    state['qty'] = 0
+                    state['hold_remaining'] = 0
+                    state['cooldown_remaining'] = COOLDOWN_BARS
+            self.conn.commit()
+        except Exception as e:
+            print(f"  ⚠️ Position integrity check skipped: {e}")
+
+    def _sync_trade_history(self) -> int:
+        """Backfill trade history from Binance for all tracked symbols.
+
+        Called at daemon startup (not every cycle). Pulls the last 7 days
+        of account trade fills from Binance, cross-references against DB,
+        and logs any trades that are NOT already in the live_trades table.
+
+        Returns the number of backfilled trades.
+        """
+        backfilled = 0
+        try:
+            client = self._get_client()
+            c = self.conn.cursor()
+
+            c.execute("SELECT MIN(entry_time) FROM live_trades")
+            min_entry = c.fetchone()[0]
+            seven_days_ago = int((time.time() - 7 * 86400) * 1000)
+            start_time = min_entry if min_entry and min_entry > seven_days_ago else seven_days_ago
+
+            for symbol in LIVE_SYMBOLS:
+                try:
+                    fills = client.get_account_trades(symbol, limit=100, start_time=start_time)
+                    if not fills:
+                        continue
+
+                    c.execute(
+                        "SELECT entry_time, exit_time, entry_price, exit_price, direction, qty "
+                        "FROM live_trades WHERE symbol=?", (symbol,)
+                    )
+                    db_trades = c.fetchall()
+
+                    fills_sorted = sorted(fills, key=lambda x: x.get('time', 0))
+                    paired = []
+                    pending_entry = None
+                    for f in fills_sorted:
+                        side = f.get('side', '')
+                        price = float(f.get('price', 0))
+                        qty_fill = float(f.get('qty', 0))
+                        ts = int(f.get('time', 0))
+
+                        if side == 'BUY' and pending_entry is None:
+                            pending_entry = {'time': ts, 'price': price, 'qty': qty_fill,
+                                            'direction': 'long', 'side': 'BUY'}
+                        elif side == 'SELL' and pending_entry is not None:
+                            pair = {'entry_time': pending_entry['time'], 'exit_time': ts,
+                                   'entry_price': pending_entry['price'], 'exit_price': price,
+                                   'qty': min(pending_entry['qty'], qty_fill), 'direction': 'long'}
+                            paired.append(pair)
+                            pending_entry = None
+                        elif side == 'SELL' and pending_entry is None:
+                            pending_entry = {'time': ts, 'price': price, 'qty': qty_fill,
+                                            'direction': 'short', 'side': 'SELL'}
+                        elif side == 'BUY' and pending_entry is not None and pending_entry['side'] == 'SELL':
+                            pair = {'entry_time': pending_entry['time'], 'exit_time': ts,
+                                   'entry_price': pending_entry['price'], 'exit_price': price,
+                                   'qty': min(pending_entry['qty'], qty_fill), 'direction': 'short'}
+                            paired.append(pair)
+                            pending_entry = None
+                        else:
+                            pending_entry = None
+
+                    for pair in paired:
+                        already_exists = False
+                        for db_entry in db_trades:
+                            time_diff = abs(pair['entry_time'] - db_entry[0])
+                            if time_diff < 60000:
+                                already_exists = True
+                                break
+
+                        if not already_exists:
+                            qty = pair['qty']
+                            entry_p = pair['entry_price']
+                            exit_p = pair['exit_price']
+                            dir_val = 1 if pair['direction'] == 'long' else -1
+
+                            if dir_val == 1:
+                                raw_pnl = qty * (exit_p - entry_p)
+                            else:
+                                raw_pnl = qty * (entry_p - exit_p)
+
+                            exit_cost = exit_p * qty * TAKER_FEE
+                            pnl_net = raw_pnl - exit_cost
+                            entry_val = entry_p * qty
+                            pnl_pct = pnl_net / entry_val * 100 if entry_val > 0 else 0
+
+                            trade = {
+                                'symbol': symbol,
+                                'direction': pair['direction'],
+                                'entry_time': pair['entry_time'],
+                                'exit_time': pair['exit_time'],
+                                'entry_price': entry_p,
+                                'exit_price': exit_p,
+                                'qty': qty,
+                                'pnl_net': pnl_net,
+                                'pnl_pct': pnl_pct,
+                                'entry_proba': 0.5,
+                                'hold_bars': int((pair['exit_time'] - pair['entry_time']) / 300000),
+                                'exit_reason': 'history_sync',
+                            }
+                            log_trade(self.conn, trade)
+                            backfilled += 1
+                            print(f"  📜 Backfilled: {symbol} {pair['direction'].upper()} ${entry_p:.4f} → ${exit_p:.4f} PnL=${pnl_net:.2f}")
+
+                except Exception as e:
+                    print(f"  ⚠️ Sync skipped for {symbol}: {e}")
+                    continue
+
+            if backfilled > 0:
+                print(f"  ✅ Sync complete: {backfilled} trade(s) backfilled from Binance history")
+            else:
+                print(f"  ✅ Sync complete: no missing trades found")
+        except Exception as e:
+            print(f"  ⚠️ Trade history sync failed: {e}")
+
+        return backfilled
 
     def _sync_wallet_balance(self) -> float:
         """Sync capital tracking with real Binance wallet balance.
@@ -370,6 +620,14 @@ class LiveTrader:
         # Initial setup: reset stale positions (from old runs) and init leverage
         self._setup_live_trading()
 
+        # Sync trade history from Binance (once per daemon startup)
+        # Pulls recent fills and backfills any trades missing from DB
+        if not self._history_synced:
+            backfilled = self._sync_trade_history()
+            self._history_synced = True
+            if backfilled > 0:
+                print(f"  📜 {backfilled} trade(s) recovered from Binance history")
+
         # Sync wallet balance with real Binance balance (incl. unrealized PnL)
         synced_balance = self._sync_wallet_balance()
         if synced_balance > 0 and synced_balance != capital:
@@ -384,6 +642,11 @@ class LiveTrader:
         self._sync_binance_positions()
 
         states = get_state(self.conn)
+
+        # Per-cycle integrity check: verify every in-DB position matches Binance
+        # Catches positions that were closed on Binance between cycles
+        self._verify_position_integrity(states)
+
         signals_total = 0
         trades_opened = 0
         trades_closed = 0
