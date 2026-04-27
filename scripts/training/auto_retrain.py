@@ -71,45 +71,9 @@ def status(msg: str, symbol: str = ""):
 # ─── Data Pipeline ─────────────────────────────────────────────────
 
 def fetch_ohlcv(symbol: str, days: int = DAYS_DATA) -> pd.DataFrame:
-    """Fetch 5m OHLCV from Binance Futures API."""
-    import requests
-    end = datetime.now()
-    start = end - timedelta(days=days)
-    limit = 1000
-    all_bars = []
-    cur = int(start.timestamp() * 1000)
-    end_ms = int(end.timestamp() * 1000)
-
-    while cur < end_ms:
-        url = "https://fapi.binance.com/fapi/v1/klines"
-        params = {'symbol': symbol, 'interval': '5m', 'limit': limit, 'startTime': cur}
-        try:
-            resp = requests.get(url, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            status(f"Fetch error: {e}", symbol)
-            break
-        if not data:
-            break
-        all_bars.extend(data)
-        cur = data[-1][0] + 1
-        if len(data) < limit:
-            break
-    
-    if not all_bars:
-        return None
-    
-    df = pd.DataFrame(all_bars, columns=[
-        'timestamp', 'open', 'high', 'low', 'close', 'volume',
-        'close_time', 'quote_asset_volume', 'n_trades',
-        'taker_buy_base', 'taker_buy_quote', 'ignore'
-    ])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    for c in ['open', 'high', 'low', 'close', 'volume']:
-        df[c] = df[c].astype(float)
-    return df
+    """Fetch 5m OHLCV from shared cache (single source of truth)."""
+    from src.strategies.ml_features import ensure_ohlcv_data
+    return ensure_ohlcv_data(symbol, min_days=days)
 
 
 def compute_target(df: pd.DataFrame, forward_bars: int = 3) -> pd.Series:

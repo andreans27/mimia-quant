@@ -25,9 +25,7 @@ import xgboost as xgb
 warnings.filterwarnings('ignore')
 
 from src.trading.state import MODEL_DIR, SEEDS, TF_GROUPS, THRESHOLD, FETCH_DAYS
-
-OHLCV_CACHE_DIR = Path("data/ohlcv_cache")
-OHLCV_FETCH_DAYS = 120  # Fetch this many days on first run for complete 4h features
+from src.strategies.ml_features import OHLCV_CACHE_DIR, OHLCV_FETCH_DAYS
 
 
 class SignalGenerator:

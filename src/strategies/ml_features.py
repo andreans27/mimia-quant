@@ -6,12 +6,64 @@ Architecture:
   independently on EACH timeframe → Align all to 5m index → Cross-TF features.
 
 Target: predict direction 9 5m-candles ahead (= 45 minutes).
+
+OHLCV Data Cache:
+  All processes (train, retrain, live) share one OHLCV cache at
+  data/ohlcv_cache/{symbol}_5m.parquet. This ensures consistent data
+  across training and inference.
 """
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
 import json
+from datetime import datetime, timedelta
+
+# ── Shared OHLCV Cache (single source of truth for ALL processes) ──────
+OHLCV_CACHE_DIR = Path("data/ohlcv_cache")
+OHLCV_FETCH_DAYS = 120  # Days of 5m data to fetch on first run
+
+
+def ensure_ohlcv_data(symbol: str, min_days: int = 120) -> Optional[pd.DataFrame]:
+    """Single source of truth for 5m OHLCV data across ALL processes.
+
+    Shared data/ohlcv_cache/{symbol}_5m.parquet used by:
+      - Live trading (signals.py)
+      - Training (prepare_ml_dataset)
+      - Retraining (auto_retrain.py)
+
+    First run: fetches min_days from Binance, caches locally.
+    Subsequent runs: reads from cache (updated incrementally by live).
+
+    Returns full DataFrame with DatetimeIndex and OHLCV columns.
+    """
+    cache_path = OHLCV_CACHE_DIR / f"{symbol}_5m.parquet"
+
+    # Check cache first
+    if cache_path.exists():
+        df = pd.read_parquet(cache_path)
+        min_bars = min_days * 288  # 288 × 5m bars per day
+        if len(df) >= min_bars:
+            return df
+        print(f"  Cache has {len(df)} bars (need {min_bars}), refreshing...")
+
+    # Fetch from Binance
+    from src.utils.binance_client import BinanceRESTClient
+    client = BinanceRESTClient(testnet=True)
+    end = datetime.now()
+    start = end - timedelta(days=min_days)
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
+
+    df = _fetch_all_klines(client, symbol, "5m", start_ms, end_ms)
+
+    # Save to shared cache
+    if df is not None and len(df) >= 1000:
+        OHLCV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(cache_path)
+        print(f"  💾 Cached {len(df)} OHLCV bars → {cache_path}")
+
+    return df
 
 
 def resample_to_timeframes(
@@ -376,10 +428,7 @@ def prepare_ml_dataset(
     """
     if intervals is None:
         intervals = ['15m', '30m', '1h', '4h']
-    
-    from src.utils.binance_client import BinanceRESTClient
-    from datetime import datetime, timedelta
-    
+
     # Cache key: differentiate from old 15m-based cache
     tf_suffix = '_'.join(sorted(intervals))
     cache_path = Path(cache_dir) / f"{symbol}_5m_{days}d_{target_candle}c_{tf_suffix}.parquet"
@@ -392,23 +441,14 @@ def prepare_ml_dataset(
         print(f"    {len(df)} rows, {len(feature_cols)} features")
         return df[feature_cols], df["target"], df.index
 
-    print(f"  Fetching {days} days of 5m data for {symbol}...")
-    client = BinanceRESTClient(testnet=True)
-    end_time = datetime.now()
-    start_time = end_time - timedelta(days=days)
-    start_ms = int(start_time.timestamp() * 1000)
-    end_ms = int(end_time.timestamp() * 1000)
-    
-    # Fetch 5m klines
-    df_5m = _fetch_all_klines(client, symbol, "5m", start_ms, end_ms)
-    
+    print(f"  Loading OHLCV data for {symbol} from shared cache...")
+    df_5m = ensure_ohlcv_data(symbol, min_days=days)
+
     if df_5m is None or len(df_5m) < 1000:
         print(f"  ⚠️ Insufficient 5m data for {symbol}")
         return None, None, None
-    
-    print(f"    {symbol}: {len(df_5m)} bars of 5m data")
-    
-    # Compute features (this does resampling internally)
+
+    print(f"    {symbol}: {len(df_5m)} bars of 5m data (shared cache)")
     print(f"  Computing features across {len(intervals)} timeframes for {symbol}...")
     combined = compute_5m_features_5tf(df_5m, target_candle=target_candle, intervals=intervals)
     
