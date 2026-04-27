@@ -74,6 +74,11 @@ PF_RED = 1.2                  # 🔴 Force retrain: PF < 1.2
 MIN_TRADES_FOR_STATS = 30     # minimum ALL-TIME trades before quality stats are meaningful
 MIN_TRADES_CURRENT_MODEL = 20 # minimum trades from CURRENT deployed model before triggering retrain
 
+# Backtest baselines — used as fallback when status file has no backtest data
+# (BT WR ~70%, BT PF ~3.0 are typical for a good model)
+WR_BACKTEST_BASELINE = 0.70    # expected backtest win rate
+PF_BACKTEST_BASELINE = 3.0     # expected backtest profit factor
+
 # Import Kelly sizer
 sys.path.insert(0, str(ROOT))
 from src.strategies.kelly_sizer import KellySizer

@@ -205,11 +205,30 @@ def train_ensemble(symbol: str, feat_df: pd.DataFrame, target: pd.Series,
             status(f"  ✅ {len(tf_metrics)} seeds avg F1={avg_f1:.4f}", symbol)
 
     # Save ensemble meta (overwrite with new version)
+    # Include features from the 'full' group models for downstream compatibility
+    # (These are used by _load_tf_group in signals.py to know which columns to extract)
+    full_features = {}
+    try:
+        for seed in SEEDS:
+            fp = MODEL_DIR / f"{symbol}_xgb_ens_{seed}.json"
+            if not fp.exists():
+                fp = MODEL_DIR / f"{symbol}_full_xgb_ens_{seed}.json"
+            if fp.exists():
+                m = xgb.XGBClassifier()
+                m.load_model(str(fp))
+                fn = m.get_booster().feature_names
+                if fn:
+                    full_features[str(seed)] = fn
+    except Exception:
+        pass
+
     meta = {
         'symbol': symbol,
         'model_params': {'uses_hparams_per_seed': True, 'hparams_source': 'train_tf_specific/train_ml_ensemble'},
         'feature_subsample_ratio': 0.75,  # MI top_k + per-seed subsampling
         'feature_count': -1,  # varies per TF group
+        'features': list(full_features.get(str(SEEDS[0]), [])),  # primary feature set
+        'model_features': full_features,  # per-seed features
         'seeds': SEEDS,
         'tf_groups': TF_GROUPS,
         'n_models': successful,

@@ -162,12 +162,12 @@ class SignalGenerator:
         """Load models for one TF group."""
         models = []
         if tf_group == 'full':
+            # Load meta.json if available (for reference, but feature names come from models)
+            meta = {}
             meta_path = MODEL_DIR / f"{symbol}_ensemble_meta.json"
-            if not meta_path.exists():
-                return None
-            with open(meta_path) as f:
-                meta = json.load(f)
-            feature_cols = meta.get('features', meta.get('full_feature_set', []))
+            if meta_path.exists():
+                with open(meta_path) as f:
+                    meta = json.load(f)
 
             for seed in SEEDS:
                 path = MODEL_DIR / f"{symbol}_xgb_ens_{seed}.json"
@@ -175,9 +175,14 @@ class SignalGenerator:
                     path = MODEL_DIR / f"{symbol}_full_xgb_ens_{seed}.json"
                 if not path.exists():
                     continue
-                mf = meta.get('model_features', {}).get(str(seed), meta.get('features', []))
                 m = xgb.XGBClassifier()
                 m.load_model(str(path))
+                # Extract feature names directly from the model
+                # (DO NOT rely on meta.json — it may not have features/model_features)
+                mf = m.get_booster().feature_names
+                if not mf:
+                    # Fallback: use meta if model has no feature_names (older models)
+                    mf = meta.get('model_features', {}).get(str(seed), meta.get('features', []))
                 models.append((str(seed), m, mf))
         else:
             prefix = f"{tf_group}_"
