@@ -132,6 +132,8 @@ def compute_proba(symbol, groups, feat_df):
         tf_probs = []
         for seed, m, mf in models:
             available = [c for c in mf if c in feat_df.columns]
+            if len(available) < 5:
+                continue
             X = feat_df[available].fillna(0).clip(-10, 10).values  # .values to avoid Arrow dtype / feature name mismatch in XGBoost inplace_predict
             probs = m.predict_proba(X)[:, 1]
             tf_probs.append(probs)

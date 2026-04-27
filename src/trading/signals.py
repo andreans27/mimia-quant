@@ -26,6 +26,9 @@ warnings.filterwarnings('ignore')
 
 from src.trading.state import MODEL_DIR, SEEDS, TF_GROUPS, THRESHOLD, FETCH_DAYS
 
+OHLCV_CACHE_DIR = Path("data/ohlcv_cache")
+OHLCV_FETCH_DAYS = 120  # Fetch this many days on first run for complete 4h features
+
 
 class SignalGenerator:
     """Generates trading signals using the multi-TF XGBoost ensemble."""
@@ -81,6 +84,103 @@ class SignalGenerator:
         df.set_index('open_time', inplace=True)
         return df[['open', 'high', 'low', 'close', 'volume']]
 
+    # ── OHLCV Cache (Incremental Update) ─────────────────────────────────
+
+    def _get_cached_ohlcv(self, symbol: str) -> Optional[pd.DataFrame]:
+        """Load cached OHLCV data from local parquet."""
+        cache_path = OHLCV_CACHE_DIR / f"{symbol}_5m.parquet"
+        if cache_path.exists():
+            df = pd.read_parquet(cache_path)
+            print(f"    💾 Cache: {len(df)} bars for {symbol}")
+            return df
+        return None
+
+    def _save_ohlcv_cache(self, symbol: str, df: pd.DataFrame):
+        """Save OHLCV data to local cache."""
+        OHLCV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_path = OHLCV_CACHE_DIR / f"{symbol}_5m.parquet"
+        df.to_parquet(cache_path)
+        print(f"    💾 Cached {len(df)} bars → {cache_path}")
+
+    def _fetch_ohlcv_range(self, symbol: str, start_ms: int) -> Optional[pd.DataFrame]:
+        """Fetch 5m OHLCV from start_ms to now (incremental)."""
+        end_ms = int(datetime.now().timestamp() * 1000)
+        if start_ms >= end_ms:
+            return None
+
+        limit = 1000
+        all_bars = []
+        last_ts = start_ms
+        while last_ts < end_ms:
+            url = "https://fapi.binance.com/fapi/v1/klines"
+            params = {
+                'symbol': symbol,
+                'interval': '5m',
+                'limit': limit,
+                'startTime': last_ts,
+                'endTime': end_ms,
+            }
+            try:
+                r = requests.get(url, params=params, timeout=30)
+                if r.status_code != 200:
+                    break
+                batch = r.json()
+                if not batch:
+                    break
+                all_bars.extend(batch)
+                last_ts = batch[-1][0] + 1
+                if len(batch) < limit:
+                    break
+            except Exception:
+                break
+
+        if not all_bars:
+            return None
+
+        df = pd.DataFrame(all_bars, columns=[
+            'open_time', 'open', 'high', 'low', 'close', 'volume',
+            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+            'taker_buy_quote', 'ignore'
+        ])
+        for c in ['open', 'high', 'low', 'close', 'volume']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+        df.set_index('open_time', inplace=True)
+        return df[['open', 'high', 'low', 'close', 'volume']]
+
+    def _ensure_ohlcv_data(self, symbol: str) -> Optional[pd.DataFrame]:
+        """Get complete OHLCV data via incremental cache.
+
+        First run: fetch OHLCV_FETCH_DAYS days and cache.
+        Subsequent runs: fetch only new bars since last cache, append, re-cache.
+        Always returns the full accumulated dataset for proper multi-TF features.
+        """
+        cached = self._get_cached_ohlcv(symbol)
+
+        if cached is not None and len(cached) >= 1000:
+            # Incremental: fetch only data newer than last cached bar
+            latest_ts = int(cached.index[-1].timestamp() * 1000) + 1
+            new_data = self._fetch_ohlcv_range(symbol, start_ms=latest_ts)
+
+            if new_data is not None and len(new_data) > 0:
+                print(f"    📡 Incremental: fetching {len(new_data)} new bars")
+                # Deduplicate and merge
+                combined = pd.concat([cached, new_data])
+                combined = combined[~combined.index.duplicated(keep='last')]
+                combined.sort_index(inplace=True)
+                self._save_ohlcv_cache(symbol, combined)
+                return combined
+
+            # No new data — use cache as-is
+            return cached
+
+        # First run (or cache too small): fetch full historical data
+        print(f"    📡 Initial fetch: {OHLCV_FETCH_DAYS}d of 5m data for {symbol}...")
+        df = self._fetch_5m_ohlcv(symbol, days=OHLCV_FETCH_DAYS)
+        if df is not None and len(df) >= 1000:
+            self._save_ohlcv_cache(symbol, df)
+        return df
+
     def _load_models(self, symbol: str):
         """Load all models for a symbol. Cache models permanently; compute fresh features from live data."""
         if symbol in self._cache and 'groups' in self._cache[symbol]:
@@ -130,15 +230,14 @@ class SignalGenerator:
                     spot_symbol = symbol[len(prefix):]
                     break
 
-        from datetime import datetime, timedelta
-
         try:
-            print(f"    📡 Fetching live 5m data for {symbol} (Spot: {spot_symbol})...")
-            df_5m = self._fetch_5m_ohlcv(spot_symbol, days=5)
+            print(f"    📡 Loading OHLCV data for {symbol} (Spot: {spot_symbol})...")
+            df_5m = self._ensure_ohlcv_data(spot_symbol)
             if df_5m is None or len(df_5m) < 500:
                 print(f"    ⚠️ Insufficient data for {symbol} (got {len(df_5m) if df_5m is not None else 0} rows)")
                 return None
 
+            print(f"    ✅ OHLCV: {len(df_5m)} bars (cached incremental)")
             print(f"    🔧 Computing features...")
             feat_df = compute_5m_features_5tf(df_5m, for_inference=True)
 
@@ -240,9 +339,9 @@ class SignalGenerator:
                     available = [c for c in mf if c in feat_df.columns]
                     if len(available) < 5:
                         continue
-                    X = feat_df[available].fillna(0).clip(-10, 10)
+                    X = feat_df[available].fillna(0).clip(-10, 10).values
                     # Use last row
-                    X_row = X.iloc[-1:].fillna(0)
+                    X_row = X[-1:]
                     probs = m.predict_proba(X_row)[:, 1]
                     tf_probs.append(probs[0])
 
@@ -265,8 +364,8 @@ class SignalGenerator:
                         available = [c for c in mf if c in feat_df.columns]
                         if len(available) < 5:
                             continue
-                        X = feat_df[available].fillna(0).clip(-10, 10)
-                        X_prev = X.iloc[-2:-1].fillna(0)
+                        X = feat_df[available].fillna(0).clip(-10, 10).values
+                        X_prev = X[-2:-1]
                         if len(X_prev) > 0:
                             probs = m.predict_proba(X_prev)[:, 1]
                             tf_probs.append(probs[0])
