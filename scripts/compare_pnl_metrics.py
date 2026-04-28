@@ -84,6 +84,8 @@ def simulate_bt(symbol: str, probas: pd.Series, prices: pd.DataFrame,
     trades = []
     long_pnl = 0.0
     short_pnl = 0.0
+    pending_signal = 0
+    pending_proba = 0.0
     
     # Align prices to proba timestamps
     aligned = prices.join(probas.to_frame('proba'), how='inner')
@@ -130,60 +132,29 @@ def simulate_bt(symbol: str, probas: pd.Series, prices: pd.DataFrame,
             
             position = 0
             cooldown = COOLDOWN_BARS
-        
-        # Entry
-            # Entry (batch-computed proba, LIMIT order at bar close + slippage,
-            # with 2-min execution delay simulated by checking next bar's price)
-            if position == 0 and cooldown <= 0:
-                sig = 0
-                if proba >= THRESHOLD: sig = 1
-                elif proba <= (1 - THRESHOLD): sig = -1
-                if sig != 0:
-                    # Step 1: Set LIMIT price based on current bar close
-                    if sig == 1:
-                        limit_price = price * (1 + SLIPPAGE)
-                    else:
-                        limit_price = price * (1 - SLIPPAGE)
 
-                    # Step 2: Simulate 2-min execution delay
-                    # Live trader computes for 2 min → enters ~bar N+1
-                    # Check if LIMIT would fill using NEXT bar's OHLCV range
-                    try:
-                        pos = aligned.index.get_loc(idx)
-                        next_idx = aligned.index[pos + 1] if pos + 1 < len(aligned) else None
-                    except Exception:
-                        next_idx = None
+        # Entry (deferred: signal dari candle N, execute di candle N+1 close)
+        if pending_signal != 0 and position == 0 and cooldown <= 0:
+            sig = pending_signal
+            pending_signal = 0
+            if sig == 1:
+                entry_price = price * (1 + SLIPPAGE)
+            else:
+                entry_price = price * (1 - SLIPPAGE)
 
-                    limit_filled = True
-                    if next_idx is not None:
-                        next_row = aligned.loc[next_idx]
-                        next_high = float(next_row['high'])
-                        next_low = float(next_row['low'])
+            entry_qty = (capital * POSITION_PCT) / entry_price
+            capital -= entry_price * entry_qty * TAKER_FEE
+            position = sig
+            entry_time = idx
+            entry_proba = pending_proba
+            hold_rem = HOLD_BARS
 
-                        if sig == 1:  # LONG: LIMIT fills if price drops to limit
-                            if next_low > limit_price:
-                                limit_filled = False
-                        else:  # SHORT: LIMIT fills if price rises to limit
-                            if next_high < limit_price:
-                                limit_filled = False
-
-                    if limit_filled:
-                        entry_price = limit_price
-                    else:
-                        # LIMIT didn't fill → MARKET at next bar close
-                        if next_idx is not None:
-                            next_close = float(aligned.loc[next_idx]['close'])
-                            entry_price = next_close * (1 + SLIPPAGE) if sig == 1 else next_close * (1 - SLIPPAGE)
-                        else:
-                            entry_price = limit_price
-
-                    entry_qty = (capital * POSITION_PCT) / entry_price
-                capital -= entry_price * entry_qty * TAKER_FEE
-                
-                position = sig
-                entry_time = idx
-                entry_proba = proba
-                hold_rem = HOLD_BARS
+        # Evaluate signal untuk candle ini (akan dieksekusi di candle berikutnya)
+        sig = 0
+        if proba >= THRESHOLD: sig = 1
+        elif proba <= (1 - THRESHOLD): sig = -1
+        pending_signal = sig
+        pending_proba = proba
     
     # Calculate metrics
     n_trades = len(trades)
