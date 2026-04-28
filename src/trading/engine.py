@@ -1012,10 +1012,13 @@ class LiveTrader:
         except Exception:
             pass
         # Round price to tick_size precision
+        # BUG FIX: f"{tick_size}" produces '1e-05' for tick_size=0.000010 (scientific notation)
+        # which has NO decimal point → split('.')[1] fails → prec=0 → round(price,0)=0!
+        # Use explicit .10f formatting to force fixed-point notation.
         prec = 4  # default precision
         if tick_size > 0:
             target_price = round(target_price / tick_size) * tick_size
-            tick_str = f"{tick_size}".rstrip('0').rstrip('.')
+            tick_str = f"{tick_size:.10f}".rstrip('0').rstrip('.')
             prec = len(tick_str.split('.')[1]) if '.' in tick_str else 0
             target_price = round(target_price, prec)
 
