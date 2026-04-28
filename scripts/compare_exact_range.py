@@ -129,6 +129,10 @@ def simulate_bt(symbol: str, initial_state: dict = None) -> dict:
         return None
     
     # ── TRADING SIMULATION ──
+    # Matches live trader's batch approach:
+    #   Phase 1: ALL signals computed using bar close data (pre-computed probas)
+    #   Phase 2: Execute trades ~2 min after bar close (simulated by using
+    #            NEXT bar's price for entry, not current bar's close)
     capital = INITIAL_CAPITAL
     if initial_state:
         position = initial_state.get('position', 0)
@@ -198,16 +202,41 @@ def simulate_bt(symbol: str, initial_state: dict = None) -> dict:
             position = 0
             cooldown = COOLDOWN_BARS
         
-        # ENTRY
+        # ENTRY (with 2-min execution delay & LIMIT fill simulation)
         if position == 0 and cooldown <= 0:
             sig = 0
             if proba >= THRESHOLD: sig = 1
             elif proba <= (1 - THRESHOLD): sig = -1
-            
+
             if sig != 0:
-                if sig == 1: entry_price = price * (1 + SLIPPAGE)
-                else: entry_price = price * (1 - SLIPPAGE)
-                
+                # Step 1: LIMIT price based on current bar close
+                if sig == 1: limit_price = price * (1 + SLIPPAGE)
+                else: limit_price = price * (1 - SLIPPAGE)
+
+                # Step 2: Check if LIMIT fills (using next bar's range)
+                try:
+                    pos = df_aligned.index.get_loc(idx)
+                    nxt = df_aligned.index[pos + 1] if pos + 1 < len(df_aligned) else None
+                except Exception:
+                    nxt = None
+
+                limit_filled = True
+                if nxt is not None:
+                    nr = df_aligned.loc[nxt]
+                    nh = float(nr['high']); nl = float(nr['low'])
+                    if sig == 1 and nl > limit_price: limit_filled = False
+                    elif sig == -1 and nh < limit_price: limit_filled = False
+
+                if limit_filled:
+                    entry_price = limit_price
+                else:
+                    # MARKET fallback at next bar close
+                    if nxt is not None:
+                        nc = float(df_aligned.loc[nxt]['close'])
+                        entry_price = nc * (1 + SLIPPAGE) if sig == 1 else nc * (1 - SLIPPAGE)
+                    else:
+                        entry_price = limit_price
+
                 entry_qty = (capital * POSITION_PCT) / entry_price
                 capital -= entry_price * entry_qty * TAKER_FEE
                 

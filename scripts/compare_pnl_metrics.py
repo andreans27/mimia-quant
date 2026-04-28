@@ -132,18 +132,52 @@ def simulate_bt(symbol: str, probas: pd.Series, prices: pd.DataFrame,
             cooldown = COOLDOWN_BARS
         
         # Entry
-        if position == 0 and cooldown <= 0:
-            sig = 0
-            if proba >= THRESHOLD: sig = 1
-            elif proba <= (1 - THRESHOLD): sig = -1
-            
-            if sig != 0:
-                if sig == 1:
-                    entry_price = price * (1 + SLIPPAGE)
-                else:
-                    entry_price = price * (1 - SLIPPAGE)
-                
-                entry_qty = (capital * POSITION_PCT) / entry_price
+            # Entry (batch-computed proba, LIMIT order at bar close + slippage,
+            # with 2-min execution delay simulated by checking next bar's price)
+            if position == 0 and cooldown <= 0:
+                sig = 0
+                if proba >= THRESHOLD: sig = 1
+                elif proba <= (1 - THRESHOLD): sig = -1
+                if sig != 0:
+                    # Step 1: Set LIMIT price based on current bar close
+                    if sig == 1:
+                        limit_price = price * (1 + SLIPPAGE)
+                    else:
+                        limit_price = price * (1 - SLIPPAGE)
+
+                    # Step 2: Simulate 2-min execution delay
+                    # Live trader computes for 2 min → enters ~bar N+1
+                    # Check if LIMIT would fill using NEXT bar's OHLCV range
+                    try:
+                        pos = aligned.index.get_loc(idx)
+                        next_idx = aligned.index[pos + 1] if pos + 1 < len(aligned) else None
+                    except Exception:
+                        next_idx = None
+
+                    limit_filled = True
+                    if next_idx is not None:
+                        next_row = aligned.loc[next_idx]
+                        next_high = float(next_row['high'])
+                        next_low = float(next_row['low'])
+
+                        if sig == 1:  # LONG: LIMIT fills if price drops to limit
+                            if next_low > limit_price:
+                                limit_filled = False
+                        else:  # SHORT: LIMIT fills if price rises to limit
+                            if next_high < limit_price:
+                                limit_filled = False
+
+                    if limit_filled:
+                        entry_price = limit_price
+                    else:
+                        # LIMIT didn't fill → MARKET at next bar close
+                        if next_idx is not None:
+                            next_close = float(aligned.loc[next_idx]['close'])
+                            entry_price = next_close * (1 + SLIPPAGE) if sig == 1 else next_close * (1 - SLIPPAGE)
+                        else:
+                            entry_price = limit_price
+
+                    entry_qty = (capital * POSITION_PCT) / entry_price
                 capital -= entry_price * entry_qty * TAKER_FEE
                 
                 position = sig
