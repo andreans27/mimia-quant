@@ -683,6 +683,10 @@ class LiveTrader:
         states = get_state(self.conn)
         self._verify_position_integrity(states)
 
+        # Bar readiness check — skip signal computation if bar not yet settled
+        bar_ready = self._is_bar_ready()
+        print(f"    📡 Bar readiness: {'READY' if bar_ready else 'WAITING — skipping signal computation'}")
+
         # ════════════════════════════════════════════════════════════════
         # Phase 1: Execute pending entries (deferred from candle N → N+1)
         #   Signal di-generate di candle N → dieksekusi di candle N+1 close
@@ -691,34 +695,39 @@ class LiveTrader:
         pending_signals = load_pending_signals(self.conn)
         trades_opened = 0
         entries_skipped = 0
-        for symbol in LIVE_SYMBOLS:
-            if symbol not in pending_signals:
-                continue
-            sig = pending_signals[symbol]
-            state = states.get(symbol, {
-                'position': 0, 'entry_price': 0, 'entry_time': 0,
-                'entry_proba': 0, 'hold_remaining': 0,
-                'cooldown_remaining': 0, 'qty': 0,
-            })
-            if state['position'] != 0:
-                print(f"  ⏭ {symbol}: pending signal SKIPPED — already in position")
-                entries_skipped += 1
-                continue
-            if state['cooldown_remaining'] > 0:
-                print(f"  ⏭ {symbol}: pending signal SKIPPED — cooldown ({state['cooldown_remaining']} bars)")
-                entries_skipped += 1
-                continue
+        if bar_ready:
+            for symbol in LIVE_SYMBOLS:
+                if symbol not in pending_signals:
+                    continue
+                sig = pending_signals[symbol]
+                state = states.get(symbol, {
+                    'position': 0, 'entry_price': 0, 'entry_time': 0,
+                    'entry_proba': 0, 'hold_remaining': 0,
+                    'cooldown_remaining': 0, 'qty': 0,
+                })
+                if state['position'] != 0:
+                    print(f"  ⏭ {symbol}: pending signal SKIPPED — already in position")
+                    entries_skipped += 1
+                    continue
+                if state['cooldown_remaining'] > 0:
+                    print(f"  ⏭ {symbol}: pending signal SKIPPED — cooldown ({state['cooldown_remaining']} bars)")
+                    entries_skipped += 1
+                    continue
 
-            # Execute deferred entry — use CURRENT bar close (candle N+1)
-            print(f"    🔵 {symbol}: executing pending {'LONG' if sig['signal']==1 else 'SHORT'} "
-                  f"(proba={sig['proba']:.4f})")
-            entry_result = self._enter_position(symbol, sig, state, capital, peak_capital)
-            if entry_result:
-                capital, peak_capital = entry_result
-                trades_opened += 1
+                # Execute deferred entry — use CURRENT bar close (candle N+1)
+                print(f"    🔵 {symbol}: executing pending {'LONG' if sig['signal']==1 else 'SHORT'} "
+                      f"(proba={sig['proba']:.4f})")
+                entry_result = self._enter_position(symbol, sig, state, capital, peak_capital)
+                if entry_result:
+                    capital, peak_capital = entry_result
+                    trades_opened += 1
 
-        # Clear executed pending signals
-        clear_pending_signals(self.conn)
+            # Clear executed pending signals — only if bar was ready
+            # (Phase 3 may re-save them if it fails)
+            clear_pending_signals(self.conn)
+        else:
+            entries_skipped = len(pending_signals)
+            print(f"  ⏭ Phase 1: Bar not settled — {entries_skipped} pending entries deferred")
         print(f"  ✅ Phase 1 complete: {trades_opened} entries executed, {entries_skipped} skipped")
 
         # ════════════════════════════════════════════════════════════════
@@ -757,28 +766,32 @@ class LiveTrader:
         print(f"\n  ⚡ Phase 3: Computing signals for next cycle...")
         new_signals = {}
         signals_total = 0
-        for i, symbol in enumerate(LIVE_SYMBOLS):
-            try:
-                print(f"  [{i+1}/{len(LIVE_SYMBOLS)}] {symbol}...")
-                gen = SignalGenerator(symbol)
-                sig = gen.generate_signal(symbol)
-                if sig and sig.get('signal', 0) != 0:
-                    signals_total += 1
-                    ts = int(time.time() * 1000)
-                    log_signal(self.conn, symbol, ts, sig['proba'], sig['signal'], capital)
-                    new_signals[symbol] = {
-                        'signal': sig['signal'],
-                        'proba': sig['proba'],
-                        'timestamp': ts,
-                        'bar_index': now_utc.strftime('%Y-%m-%d %H:%M'),
-                    }
-                    d = 'LONG' if sig['signal']==1 else 'SHORT'
-                    print(f"    proba={sig['proba']:.4f} ({d}) → PENDING for next cycle")
-                else:
-                    p = sig['proba'] if sig else 0
-                    print(f"    proba={p:.4f} (FLAT)")
-            except Exception as e:
-                print(f"    ⚠️ Error: {e}")
+        if bar_ready:
+            for i, symbol in enumerate(LIVE_SYMBOLS):
+                try:
+                    print(f"  [{i+1}/{len(LIVE_SYMBOLS)}] {symbol}...")
+                    gen = SignalGenerator(symbol)
+                    sig = gen.generate_signal(symbol)
+                    if sig and sig.get('signal', 0) != 0:
+                        signals_total += 1
+                        ts = int(time.time() * 1000)
+                        log_signal(self.conn, symbol, ts, sig['proba'], sig['signal'], capital)
+                        new_signals[symbol] = {
+                            'signal': sig['signal'],
+                            'proba': sig['proba'],
+                            'timestamp': ts,
+                            'bar_index': now_utc.strftime('%Y-%m-%d %H:%M'),
+                        }
+                        d = 'LONG' if sig['signal']==1 else 'SHORT'
+                        print(f"    proba={sig['proba']:.4f} ({d}) → PENDING for next cycle")
+                    else:
+                        p = sig['proba'] if sig else 0
+                        print(f"    proba={p:.4f} (FLAT)")
+                except Exception as e:
+                    print(f"    ⚠️ Error: {e}")
+        else:
+            print(f"  ⏭ Phase 3: Bar not settled — skipping signal computation")
+            # Pending signals from previous cycle still in DB (Phase 1 didn't clear)
 
         # Save pending signals for next cycle execution
         save_pending_signals(self.conn, new_signals)
