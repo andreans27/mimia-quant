@@ -26,36 +26,29 @@ OHLCV_FETCH_DAYS = 120  # Days of 5m data to fetch on first run
 
 def ensure_ohlcv_data(symbol: str, min_days: int = 120) -> Optional[pd.DataFrame]:
     """Single source of truth for 5m OHLCV data across ALL processes.
+    Uses the SAME public Futures API as signals.py (fapi.binance.com),
+    NOT testnet — so live trader, training, and retraining all see identical data.
 
-    Shared data/ohlcv_cache/{symbol}_5m.parquet used by:
-      - Live trading (signals.py)
-      - Training (prepare_ml_dataset)
-      - Retraining (auto_retrain.py)
+    Args:
+        symbol: Trading symbol (e.g. 'ETHUSDT')
+        min_days: Minimum days of data to keep in cache
 
-    First run: fetches min_days from Binance, caches locally.
-    Subsequent runs: reads from cache (updated incrementally by live).
-
-    Returns full DataFrame with DatetimeIndex and OHLCV columns.
+    Returns:
+        DataFrame with DatetimeIndex and OHLCV columns, or None if unavailable
     """
     cache_path = OHLCV_CACHE_DIR / f"{symbol}_5m.parquet"
 
-    # Check cache first
+    # Check cache first — return immediately if sufficient
     if cache_path.exists():
         df = pd.read_parquet(cache_path)
-        min_bars = min_days * 288  # 288 × 5m bars per day
+        min_bars = min_days * 288
         if len(df) >= min_bars:
             return df
         print(f"  Cache has {len(df)} bars (need {min_bars}), refreshing...")
 
-    # Fetch from Binance
-    from src.utils.binance_client import BinanceRESTClient
-    client = BinanceRESTClient(testnet=True)
-    end = datetime.now()
-    start = end - timedelta(days=min_days)
-    start_ms = int(start.timestamp() * 1000)
-    end_ms = int(end.timestamp() * 1000)
-
-    df = _fetch_all_klines(client, symbol, "5m", start_ms, end_ms)
+    # Fetch from Binance PUBLIC Futures API (same source as live trader)
+    # NOT from testnet — critical for data consistency across all processes
+    df = _fetch_5m_public_klines(symbol, days=min_days)
 
     # Save to shared cache
     if df is not None and len(df) >= 1000:
@@ -64,6 +57,61 @@ def ensure_ohlcv_data(symbol: str, min_days: int = 120) -> Optional[pd.DataFrame
         print(f"  💾 Cached {len(df)} OHLCV bars → {cache_path}")
 
     return df
+
+
+def _fetch_5m_public_klines(symbol: str, days: int = 120) -> Optional[pd.DataFrame]:
+    """Fetch 5m OHLCV from Binance public Futures API (no auth needed).
+    Uses fapi.binance.com — same endpoint as the live trader's SignalGenerator.
+    This ensures ALL processes (live, training, retrain) use identical data.
+    """
+    import requests
+    end = datetime.now()
+    start = end - timedelta(days=days)
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
+
+    limit = 1000
+    all_bars = []
+    last_ts = start_ms
+    url = "https://fapi.binance.com/fapi/v1/klines"
+
+    while last_ts < end_ms:
+        params = {
+            'symbol': symbol,
+            'interval': '5m',
+            'limit': limit,
+            'startTime': last_ts,
+            'endTime': end_ms,
+        }
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            if r.status_code != 200:
+                break
+            batch = r.json()
+            if not batch:
+                break
+            all_bars.extend(batch)
+            last_ts = batch[-1][0] + 1
+            if len(batch) < limit:
+                break
+        except Exception:
+            break
+
+    if len(all_bars) < 1000:
+        print(f"    ❌ Insufficient data: {len(all_bars)} bars")
+        return None
+
+    df = pd.DataFrame(all_bars, columns=[
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+        'taker_buy_quote', 'ignore'
+    ])
+    for c in ['open', 'high', 'low', 'close', 'volume']:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+    df.set_index('open_time', inplace=True)
+    df = df[~df.index.duplicated(keep='last')].sort_index()
+    return df[['open', 'high', 'low', 'close', 'volume']]
 
 
 def resample_to_timeframes(

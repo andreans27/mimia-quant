@@ -652,11 +652,25 @@ class LiveTrader:
     def run(self):
         """Execute one full live trading cycle."""
         start_time = time.time()
+        now_utc = datetime.utcnow()
         print(f"\n{'='*60}")
-        print(f"  LIVE TRADE RUN — {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')} {'(' + self.network.upper() + ')'}")
+        print(f"  LIVE TRADE RUN — {now_utc.strftime('%Y-%m-%d %H:%M UTC')} {'(' + self.network.upper() + ')'}")
         print(f"{'='*60}")
 
         capital, peak_capital = get_capital(self.conn)
+
+        # ── Bar-Boundary Synchronization ─────────────────────────────
+        # Check: is the latest closed bar old enough (>= 4.5 min) to be final?
+        # If not, we SKIP signal generation this cycle — only do maintenance.
+        # This aligns live trader evaluation with bar close times,
+        # matching backtest simulation behavior.
+        bar_ready = self._is_bar_ready()
+        if not bar_ready:
+            print(f"  ⏳ Bar not yet ready (waiting for next 5m close)")
+            print(f"  → Maintenance only: position exits, wallet sync, state cleanup")
+        else:
+            print(f"  ✅ Bar ready — signal generation enabled")
+        # ──────────────────────────────────────────────────────────────
 
         # Initial setup: reset stale positions (from old runs) and init leverage
         self._setup_live_trading()
@@ -718,8 +732,8 @@ class LiveTrader:
                         trades_closed += 1
                         print(f"    ✅ EXIT {symbol} — {trade_line}")
 
-            # Generate signal if no position and not in cooldown
-            if state['position'] == 0 and state['cooldown_remaining'] <= 0:
+            # Generate signal if bar is ready AND no position AND no cooldown
+            if bar_ready and state['position'] == 0 and state['cooldown_remaining'] <= 0:
                 gen = self._load_models(symbol)
                 sig = gen.generate_signal(symbol)
                 if sig:
@@ -767,6 +781,36 @@ class LiveTrader:
 
         return capital, peak_capital, dd
 
+    def _is_bar_ready(self) -> bool:
+        """Check if the latest 5m OHLCV bar is old enough (>= 4.5 min) to be final.
+
+        Bar settling: Binance may update OHLCV data for ~2-3 min after close.
+        By waiting until >= 4.5 min, we ensure:
+        - The bar data is FINAL (no more settling updates)
+        - The model proba is deterministic (same as backtest)
+        - Entry prices align with bar close (matching backtest)
+
+        Returns:
+            True if bar is ready for signal generation, False to skip trading
+        """
+        try:
+            from src.strategies.ml_features import OHLCV_CACHE_DIR
+            for sym in LIVE_SYMBOLS[:1]:  # Check first symbol as reference
+                spot = sym[4:] if sym.startswith("1000") else sym
+                cache = OHLCV_CACHE_DIR / f"{spot}_5m.parquet"
+                if cache.exists():
+                    df = pd.read_parquet(cache)
+                    latest_ts = df.index[-1]
+                    age_s = (datetime.utcnow() - latest_ts).total_seconds()
+                    # Bar is ready when >= 270 seconds old (4.5 min)
+                    # This gives Binance 2-3 min to settle + buffer
+                    ready = age_s >= 270
+                    print(f"    📡 Latest bar: {latest_ts} (age={age_s:.0f}s) {'READY' if ready else 'WAITING'}")
+                    return ready
+        except Exception as e:
+            print(f"    ⚠️ Bar check failed: {e}")
+        return True  # Default: proceed if check fails
+
     def _check_enter(self, symbol: str, state: Dict, capital: float,
                      peak_capital: float, proba: float) -> bool:
         """Check if entry conditions are met (threshold + cooldown)."""
@@ -777,7 +821,12 @@ class LiveTrader:
 
     def _enter_position(self, symbol: str, sig: Dict, state: Dict,
                         capital: float, peak_capital: float) -> Optional[Tuple[float, float]]:
-        """Enter a live trade position — simulates in DB + places real MARKET order on Binance (testnet or mainnet)."""
+        """Enter a live trade position — uses LIMIT order at bar close price
+        (matching backtest entry), falls back to MARKET order if un-filled.
+
+        Using LIMIT at bar close ensures the entry price matches
+        what the backtest simulation would use, making PnL inline.
+        """
         direction = sig['signal']  # 1=long, -1=short
         proba = sig['proba']
         direction_label = 'LONG' if direction == 1 else 'SHORT'
@@ -785,18 +834,28 @@ class LiveTrader:
         entry_price = None
         client = self._get_client()
 
-        # Step 1: Get current price and place real order on Binance
+        # Step 1: Get bar close price from OHLCV cache (matches backtest reference)
         try:
-            ob = client.get_orderbook_depth(symbol)
-            if direction == 1:
-                price_ref = float(ob['asks'][0][0])
+            from src.strategies.ml_features import OHLCV_CACHE_DIR
+            cache_path = OHLCV_CACHE_DIR / f"{symbol}_5m.parquet"
+            if cache_path.exists():
+                df_cache = pd.read_parquet(cache_path)
+                last_close = float(df_cache['close'].iloc[-1])
+                price_ref = last_close
             else:
-                price_ref = float(ob['bids'][0][0])
-        except Exception as e:
-            print(f"    ⚠️ Orderbook fetch failed: {e}")
-            price_ref = 50000.0  # fallback
+                raise FileNotFoundError("No OHLCV cache")
+        except Exception:
+            # Fallback: use orderbook
+            try:
+                ob = client.get_orderbook_depth(symbol)
+                if direction == 1:
+                    price_ref = float(ob['asks'][0][0])
+                else:
+                    price_ref = float(ob['bids'][0][0])
+            except Exception:
+                price_ref = 50000.0
 
-        # Calculate position size: use Kelly sizing from DB, fallback to fixed 10%
+        # Calculate position size
         try:
             from src.strategies.kelly_sizer import KellySizer
             kelly = KellySizer()
@@ -804,15 +863,15 @@ class LiveTrader:
             if symbol in sizes:
                 kelly_pct = sizes[symbol].get('position_pct', 0.10)
             else:
-                kelly_pct = MARGIN_PCT * LEVERAGE_X  # 0.10 default
+                kelly_pct = MARGIN_PCT * LEVERAGE_X
         except Exception:
             kelly_pct = MARGIN_PCT * LEVERAGE_X
-        kelly_pct = max(0.02, min(kelly_pct, 0.25))  # cap 2%–25%
+        kelly_pct = max(0.02, min(kelly_pct, 0.25))
         position_value = capital * kelly_pct
         raw_qty = position_value / price_ref
 
-        # Round qty to LOT_SIZE step_size for the symbol
-        step_size = 0.01  # default
+        # Round qty to LOT_SIZE
+        step_size = 0.01
         min_qty = 0.01
         try:
             exch_info = client.get_exchange_info()
@@ -831,7 +890,6 @@ class LiveTrader:
         if qty < min_qty:
             qty = min_qty
             print(f"    ⚠️ Qty below min, using {min_qty}")
-        # Keep reasonable decimal precision (handle integer or float step_size)
         step_str = f"{step_size}".rstrip('0').rstrip('.')
         if '.' in step_str:
             step_prec = max(6, len(step_str.split('.')[1]))
@@ -842,12 +900,23 @@ class LiveTrader:
         side = "BUY" if direction == 1 else "SELL"
         order_placed = False
         executed_qty_actual = 0.0
+
+        # Step 2: Calculate limit price — match backtest bar close + slippage
+        if direction == 1:
+            limit_price = price_ref * (1 + SLIPPAGE)  # Slightly above close for buy
+        else:
+            limit_price = price_ref * (1 - SLIPPAGE)  # Slightly below close for sell
+
+        print(f"    📡 LIMIT ORDER: {side} {symbol} qty={qty:.6f} @ ${limit_price:.4f} (based on bar close ${price_ref:.4f})")
+
         try:
-            # Place real order on Binance
+            # Place LIMIT order first (matches backtest entry price)
             order_resp = client.place_order(
                 symbol=symbol,
                 side=side,
-                order_type="MARKET",
+                order_type="LIMIT",
+                time_in_force="GTC",
+                price=limit_price,
                 quantity=qty,
             )
             order_id = order_resp.get('order_id')
@@ -855,8 +924,8 @@ class LiveTrader:
                 order_id = order_resp.get('client_order_id')
             status_code = order_resp.get('status', 'N/A')
 
-            # Poll get_order() for actual fill data (up to 6 attempts, 1s apart)
-            for attempt in range(6):
+            # Poll for fill (up to 10 attempts, 1s apart = 10s max wait)
+            for attempt in range(10):
                 time.sleep(1)
                 try:
                     fill_resp = client.get_order(symbol=symbol, order_id=order_id)
@@ -868,12 +937,46 @@ class LiveTrader:
                             entry_price = avg_px
                             executed_qty_actual = ex_qty
                             order_placed = True
-                            print(f"    📡 ORDER FILLED: {side} {symbol} qty={ex_qty:.6f} @ ${avg_px:.4f} (order #{order_id})")
+                            print(f"    📡 LIMIT FILLED: {side} {symbol} qty={ex_qty:.6f} @ ${avg_px:.4f} (order #{order_id})")
                             break
                 except Exception:
                     pass
 
+            # If LIMIT not filled, cancel and use MARKET as fallback
             if not order_placed:
+                try:
+                    client.cancel_order(symbol=symbol, order_id=order_id)
+                    print(f"    ⏳ LIMIT not filled, canceling order #{order_id}")
+                except Exception:
+                    pass
+
+                print(f"    ⏩ MARKET fallback: {side} {symbol} qty={qty:.6f}")
+                market_resp = client.place_order(
+                    symbol=symbol,
+                    side=side,
+                    order_type="MARKET",
+                    quantity=qty,
+                )
+                mkt_order_id = market_resp.get('order_id')
+                if mkt_order_id is None or mkt_order_id == '?':
+                    mkt_order_id = market_resp.get('client_order_id')
+
+                for attempt in range(6):
+                    time.sleep(1)
+                    try:
+                        fill_resp = client.get_order(symbol=symbol, order_id=mkt_order_id)
+                        if isinstance(fill_resp, dict):
+                            fill_status = fill_resp.get('status', '')
+                            ex_qty = float(fill_resp.get('executed_qty', 0))
+                            avg_px = float(fill_resp.get('avg_price', 0))
+                            if fill_status == 'FILLED' and ex_qty > 0 and avg_px > 0:
+                                entry_price = avg_px
+                                executed_qty_actual = ex_qty
+                                order_placed = True
+                                print(f"    📡 MARKET FILLED: {side} {symbol} qty={ex_qty:.6f} @ ${avg_px:.4f}")
+                                break
+                    except Exception:
+                        pass
                 # Fallback 1: use account_information_v2 which has REAL entry_price field
                 # (unlike get_position_info() which reports notional = mark_price × amt)
                 time.sleep(1)
