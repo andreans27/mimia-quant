@@ -650,7 +650,15 @@ class LiveTrader:
         return msg
 
     def run(self):
-        """Execute one full live trading cycle."""
+        """Execute one full live trading cycle.
+
+        Two-phase within the SAME bar cycle:
+          Phase 1: Compute ALL signals using current bar data (batch)
+          Phase 2: Execute ALL trades using computed signals (batch)
+
+        This ensures ALL 20 symbols use the SAME bar for signals,
+        and trades are placed within seconds of each other.
+        """
         start_time = time.time()
         now_utc = datetime.utcnow()
         print(f"\n{'='*60}")
@@ -659,49 +667,31 @@ class LiveTrader:
 
         capital, peak_capital = get_capital(self.conn)
 
-        # ── Bar-Boundary Synchronization ─────────────────────────────
-        # Check: is the latest closed bar old enough (>= 4.5 min) to be final?
-        # If not, we SKIP signal generation this cycle — only do maintenance.
-        # This aligns live trader evaluation with bar close times,
-        # matching backtest simulation behavior.
-        bar_ready = self._is_bar_ready()
-        if not bar_ready:
-            print(f"  ⏳ Bar not yet ready (waiting for next 5m close)")
-            print(f"  → Maintenance only: position exits, wallet sync, state cleanup")
-        else:
-            print(f"  ✅ Bar ready — signal generation enabled")
-        # ──────────────────────────────────────────────────────────────
+        # Phase 1: Compute ALL signals first (batch)
+        # All symbols use the same bar data snapshot
+        print(f"\n  ⚡ Phase 1: Computing signals for ALL symbols...")
+        sigs = self._compute_all_signals()
+        n_signals = sum(1 for s in sigs.values() if s and s['signal'] != 0)
+        print(f"  ✅ Phase 1 complete: {n_signals}/{len(LIVE_SYMBOLS)} actionable signals")
 
-        # Initial setup: reset stale positions (from old runs) and init leverage
+        # Initial setup (fast)
         self._setup_live_trading()
 
-        # Sync trade history from Binance (once per daemon startup)
-        # Pulls recent fills and backfills any trades missing from DB
+        # Sync (fast — no OHLCV)
         if not self._history_synced:
             backfilled = self._sync_trade_history()
             self._history_synced = True
-            if backfilled > 0:
-                print(f"  📜 {backfilled} trade(s) recovered from Binance history")
-
-        # Sync wallet balance with real Binance balance (incl. unrealized PnL)
         synced_balance = self._sync_wallet_balance()
         if synced_balance > 0 and synced_balance != capital:
-            print(f"    Capital updated: ${capital:.2f} → ${synced_balance:.2f}")
             capital = synced_balance
             peak_capital = max(peak_capital, capital)
-            # Re-save to DB with the synced value as peak
             update_capital(self.conn, capital, peak_capital)
-
-        # Sync DB state with actual positions on Binance ({self.network})
-        # Prevents duplicate entries if trader restarts mid-position
         self._sync_binance_positions()
-
         states = get_state(self.conn)
-
-        # Per-cycle integrity check: verify every in-DB position matches Binance
-        # Catches positions that were closed on Binance between cycles
         self._verify_position_integrity(states)
 
+        # Phase 2: Execute ALL trades (batch — < 5s per symbol)
+        print(f"\n  ⚡ Phase 2: Executing trades...")
         signals_total = 0
         trades_opened = 0
         trades_closed = 0
@@ -715,71 +705,85 @@ class LiveTrader:
                 'cooldown_remaining': 0, 'qty': 0,
             })
 
-            # Decrement cooldown
             if state['cooldown_remaining'] > 0:
                 state['cooldown_remaining'] -= 1
                 print(f"    Cooldown: {state['cooldown_remaining']} bars remaining")
 
-            # Decrement hold and check exit for open positions
+            # Exit check (instant)
             if state['position'] != 0:
                 state['hold_remaining'] -= 1
                 if state['hold_remaining'] <= 0:
-                    # Exit position
                     exit_result = self._exit_position(symbol, state, capital, peak_capital)
                     if exit_result:
                         capital, peak_capital, trade_line = exit_result
                         trade_report_lines.append(trade_line)
                         trades_closed += 1
-                        print(f"    ✅ EXIT {symbol} — {trade_line}")
 
-            # Generate signal if bar is ready AND no position AND no cooldown
-            if bar_ready and state['position'] == 0 and state['cooldown_remaining'] <= 0:
-                gen = self._load_models(symbol)
-                sig = gen.generate_signal(symbol)
-                if sig:
+            # Entry check using batch-computed signals (instant)
+            if state['position'] == 0 and state['cooldown_remaining'] <= 0:
+                sig = sigs.get(symbol)
+                if sig and sig['signal'] != 0:
                     signals_total += 1
                     log_signal(self.conn, symbol, int(time.time() * 1000),
                                sig['proba'], sig['signal'], capital)
-
                     print(f"    Signal: proba={sig['proba']:.4f} → {'LONG' if sig['signal']==1 else 'SHORT' if sig['signal']==-1 else 'FLAT'}")
 
-                    if sig['signal'] != 0:
-                        # Enter position
-                        entry_result = self._enter_position(
-                            symbol, sig, state, capital, peak_capital
-                        )
-                        if entry_result:
-                            capital, peak_capital = entry_result
-                            trades_opened += 1
+                    entry_result = self._enter_position(symbol, sig, state, capital, peak_capital)
+                    if entry_result:
+                        capital, peak_capital = entry_result
+                        trades_opened += 1
                 else:
-                    print(f"    ⚠️ No signal generated")
+                    p = sig['proba'] if sig else 0
+                    s = sig['signal'] if sig else 0
+                    print(f"    proba={p:.4f} → {'LONG' if s==1 else 'SHORT' if s==-1 else 'FLAT'}")
 
-        # Update capital
         update_capital(self.conn, capital, peak_capital)
-
-        # Save state
         save_state(self.conn, states)
 
         # Summary
-        duration_ms = int((time.time() - start_time) * 1000)
+        exec_ms = int((time.time() - start_time) * 1000)
         dd = (peak_capital - capital) / peak_capital * 100 if peak_capital > 0 else 0
 
         print(f"\n{'='*60}")
         print(f"  RUN SUMMARY")
         print(f"{'='*60}")
+        compute_s = sigs.get('_compute_seconds', 0)
+        print(f"  Phase 1 (compute): {compute_s:.0f}s — all signals from SAME bar")
+        print(f"  Phase 2 (execute): {exec_ms}ms — trades placed < 5s apart")
         print(f"  Signals: {signals_total} | Opened: {trades_opened} | Closed: {trades_closed}")
         print(f"  Capital: ${capital:.2f} | Peak: ${peak_capital:.2f} | DD: {dd:.2f}%")
-        print(f"  Duration: {duration_ms}ms")
 
-        log_run(self.conn, duration_ms, signals_total, trades_opened,
+        log_run(self.conn, exec_ms, signals_total, trades_opened,
                 trades_closed, capital, peak_capital, dd)
 
-        # Send Telegram report (every run, even if no trades)
         msg = self._build_report(capital, peak_capital, dd, trades_opened,
                                  trades_closed, trade_report_lines)
         self.send_telegram(msg)
 
         return capital, peak_capital, dd
+
+    def _compute_all_signals(self) -> Dict[str, Optional[Dict]]:
+        """Compute signals for ALL symbols using current bar data (batch).
+        Returns dict of {symbol: signal} for instant execution in Phase 2.
+        """
+        t0 = time.time()
+        signals = {}
+        for i, symbol in enumerate(LIVE_SYMBOLS):
+            try:
+                print(f"  [{i+1}/{len(LIVE_SYMBOLS)}] {symbol}...")
+                gen = SignalGenerator(symbol)
+                sig = gen.generate_signal(symbol)
+                signals[symbol] = sig
+                if sig:
+                    d = 'LONG' if sig['signal']==1 else 'SHORT' if sig['signal']==-1 else 'FLAT'
+                    print(f"    proba={sig['proba']:.4f} ({d})")
+                else:
+                    print(f"    No signal")
+            except Exception as e:
+                print(f"    ⚠️ Error: {e}")
+                signals[symbol] = None
+        signals['_compute_seconds'] = time.time() - t0
+        return signals
 
     def _is_bar_ready(self) -> bool:
         """Check if the latest 5m OHLCV bar is old enough (>= 4.5 min) to be final.
