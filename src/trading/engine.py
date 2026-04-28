@@ -32,6 +32,7 @@ load_dotenv()  # Load .env for Binance API keys
 from src.trading.state import (
     init_db, get_state, save_state, get_capital, update_capital,
     log_signal, log_trade, log_run,
+    save_pending_signals, load_pending_signals, clear_pending_signals,
     DB_PATH, INITIAL_CAPITAL, LIVE_SYMBOLS,
     THRESHOLD, HOLD_BARS, COOLDOWN_BARS, MARGIN_PCT, LEVERAGE_X,
     TAKER_FEE, SLIPPAGE, MODEL_DIR, SEEDS,
@@ -652,12 +653,13 @@ class LiveTrader:
     def run(self):
         """Execute one full live trading cycle.
 
-        Two-phase within the SAME bar cycle:
-          Phase 1: Compute ALL signals using current bar data (batch)
-          Phase 2: Execute ALL trades using computed signals (batch)
+        Deferred Entry Flow (Candle N → Candle N+1):
+          Phase 1: Execute pending entries from candle N signals (use candle N+1 close)
+          Phase 2: Exit positions that are due (hold_expiry)
+          Phase 3: Compute NEW signals for candle N+1 → store as pending for candle N+2
 
-        This ensures ALL 20 symbols use the SAME bar for signals,
-        and trades are placed within seconds of each other.
+        This ensures backtest vs live trader use the SAME signal → entry timing,
+        making PnL comparison meaningful.
         """
         start_time = time.time()
         now_utc = datetime.utcnow()
@@ -667,17 +669,8 @@ class LiveTrader:
 
         capital, peak_capital = get_capital(self.conn)
 
-        # Phase 1: Compute ALL signals first (batch)
-        # All symbols use the same bar data snapshot
-        print(f"\n  ⚡ Phase 1: Computing signals for ALL symbols...")
-        sigs = self._compute_all_signals()
-        n_signals = sum(1 for s in sigs.values() if s and s['signal'] != 0)
-        print(f"  ✅ Phase 1 complete: {n_signals}/{len(LIVE_SYMBOLS)} actionable signals")
-
-        # Initial setup (fast)
+        # Initial setup & sync (fast — no OHLCV)
         self._setup_live_trading()
-
-        # Sync (fast — no OHLCV)
         if not self._history_synced:
             backfilled = self._sync_trade_history()
             self._history_synced = True
@@ -690,26 +683,61 @@ class LiveTrader:
         states = get_state(self.conn)
         self._verify_position_integrity(states)
 
-        # Phase 2: Execute ALL trades (batch — < 5s per symbol)
-        print(f"\n  ⚡ Phase 2: Executing trades...")
-        signals_total = 0
+        # ════════════════════════════════════════════════════════════════
+        # Phase 1: Execute pending entries (deferred from candle N → N+1)
+        #   Signal di-generate di candle N → dieksekusi di candle N+1 close
+        # ════════════════════════════════════════════════════════════════
+        print(f"\n  ⚡ Phase 1: Executing pending entries (deferred from previous cycle)...")
+        pending_signals = load_pending_signals(self.conn)
         trades_opened = 0
-        trades_closed = 0
-        trade_report_lines = []
-
-        for i, symbol in enumerate(LIVE_SYMBOLS):
-            print(f"\n  [{i+1}/{len(LIVE_SYMBOLS)}] {symbol}...")
+        entries_skipped = 0
+        for symbol in LIVE_SYMBOLS:
+            if symbol not in pending_signals:
+                continue
+            sig = pending_signals[symbol]
             state = states.get(symbol, {
                 'position': 0, 'entry_price': 0, 'entry_time': 0,
                 'entry_proba': 0, 'hold_remaining': 0,
                 'cooldown_remaining': 0, 'qty': 0,
             })
+            if state['position'] != 0:
+                print(f"  ⏭ {symbol}: pending signal SKIPPED — already in position")
+                entries_skipped += 1
+                continue
+            if state['cooldown_remaining'] > 0:
+                print(f"  ⏭ {symbol}: pending signal SKIPPED — cooldown ({state['cooldown_remaining']} bars)")
+                entries_skipped += 1
+                continue
 
+            # Execute deferred entry — use CURRENT bar close (candle N+1)
+            print(f"    🔵 {symbol}: executing pending {'LONG' if sig['signal']==1 else 'SHORT'} "
+                  f"(proba={sig['proba']:.4f})")
+            entry_result = self._enter_position(symbol, sig, state, capital, peak_capital)
+            if entry_result:
+                capital, peak_capital = entry_result
+                trades_opened += 1
+
+        # Clear executed pending signals
+        clear_pending_signals(self.conn)
+        print(f"  ✅ Phase 1 complete: {trades_opened} entries executed, {entries_skipped} skipped")
+
+        # ════════════════════════════════════════════════════════════════
+        # Phase 2: Exit positions that are due (hold_expiry)
+        # ════════════════════════════════════════════════════════════════
+        print(f"\n  ⚡ Phase 2: Checking exits...")
+        trades_closed = 0
+        trade_report_lines = []
+        for symbol in LIVE_SYMBOLS:
+            state = states.get(symbol, {
+                'position': 0, 'entry_price': 0, 'entry_time': 0,
+                'entry_proba': 0, 'hold_remaining': 0,
+                'cooldown_remaining': 0, 'qty': 0,
+            })
+            # Decrement cooldown
             if state['cooldown_remaining'] > 0:
                 state['cooldown_remaining'] -= 1
-                print(f"    Cooldown: {state['cooldown_remaining']} bars remaining")
 
-            # Exit check (instant)
+            # Exit check
             if state['position'] != 0:
                 state['hold_remaining'] -= 1
                 if state['hold_remaining'] <= 0:
@@ -719,39 +747,60 @@ class LiveTrader:
                         trade_report_lines.append(trade_line)
                         trades_closed += 1
 
-            # Entry check using batch-computed signals (instant)
-            if state['position'] == 0 and state['cooldown_remaining'] <= 0:
-                sig = sigs.get(symbol)
-                if sig and sig['signal'] != 0:
-                    signals_total += 1
-                    log_signal(self.conn, symbol, int(time.time() * 1000),
-                               sig['proba'], sig['signal'], capital)
-                    print(f"    Signal: proba={sig['proba']:.4f} → {'LONG' if sig['signal']==1 else 'SHORT' if sig['signal']==-1 else 'FLAT'}")
+        save_state(self.conn, states)
+        print(f"  ✅ Phase 2 complete: {trades_closed} exits executed")
 
-                    entry_result = self._enter_position(symbol, sig, state, capital, peak_capital)
-                    if entry_result:
-                        capital, peak_capital = entry_result
-                        trades_opened += 1
+        # ════════════════════════════════════════════════════════════════
+        # Phase 3: Compute NEW signals for current cycle
+        #   Store as pending → will be executed at candle N+2 close
+        # ════════════════════════════════════════════════════════════════
+        print(f"\n  ⚡ Phase 3: Computing signals for next cycle...")
+        new_signals = {}
+        signals_total = 0
+        for i, symbol in enumerate(LIVE_SYMBOLS):
+            try:
+                print(f"  [{i+1}/{len(LIVE_SYMBOLS)}] {symbol}...")
+                gen = SignalGenerator(symbol)
+                sig = gen.generate_signal(symbol)
+                if sig and sig.get('signal', 0) != 0:
+                    signals_total += 1
+                    ts = int(time.time() * 1000)
+                    log_signal(self.conn, symbol, ts, sig['proba'], sig['signal'], capital)
+                    new_signals[symbol] = {
+                        'signal': sig['signal'],
+                        'proba': sig['proba'],
+                        'timestamp': ts,
+                        'bar_index': now_utc.strftime('%Y-%m-%d %H:%M'),
+                    }
+                    d = 'LONG' if sig['signal']==1 else 'SHORT'
+                    print(f"    proba={sig['proba']:.4f} ({d}) → PENDING for next cycle")
                 else:
                     p = sig['proba'] if sig else 0
-                    s = sig['signal'] if sig else 0
-                    print(f"    proba={p:.4f} → {'LONG' if s==1 else 'SHORT' if s==-1 else 'FLAT'}")
+                    print(f"    proba={p:.4f} (FLAT)")
+            except Exception as e:
+                print(f"    ⚠️ Error: {e}")
 
-        update_capital(self.conn, capital, peak_capital)
-        save_state(self.conn, states)
+        # Save pending signals for next cycle execution
+        save_pending_signals(self.conn, new_signals)
+        print(f"  ✅ Phase 3 complete: {len(new_signals)}/{signals_total} signals stored as pending")
 
+        # ════════════════════════════════════════════════════════════════
         # Summary
+        # ════════════════════════════════════════════════════════════════
+        update_capital(self.conn, capital, peak_capital)
         exec_ms = int((time.time() - start_time) * 1000)
         dd = (peak_capital - capital) / peak_capital * 100 if peak_capital > 0 else 0
+        pending_sig = len(new_signals)
 
         print(f"\n{'='*60}")
         print(f"  RUN SUMMARY")
         print(f"{'='*60}")
-        compute_s = sigs.get('_compute_seconds', 0)
-        print(f"  Phase 1 (compute): {compute_s:.0f}s — all signals from SAME bar")
-        print(f"  Phase 2 (execute): {exec_ms}ms — trades placed < 5s apart")
-        print(f"  Signals: {signals_total} | Opened: {trades_opened} | Closed: {trades_closed}")
+        print(f"  Phase 1 (pending entries): {trades_opened} entries executed from prev cycle")
+        print(f"  Phase 2 (exits):           {trades_closed} positions closed")
+        print(f"  Phase 3 (new signals):     {pending_sig} signals stored as pending for next cycle")
+        print(f"  Execution:                 {exec_ms}ms")
         print(f"  Capital: ${capital:.2f} | Peak: ${peak_capital:.2f} | DD: {dd:.2f}%")
+        print(f"  Pending signals stored:    {signals_total} total, {len(new_signals)} actionable")
 
         log_run(self.conn, exec_ms, signals_total, trades_opened,
                 trades_closed, capital, peak_capital, dd)

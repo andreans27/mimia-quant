@@ -21,8 +21,8 @@
 | **Strategy** | Multi-TF XGBoost Ensemble (5m, 15m, 30m, 1h, 4h) |
 | **Signal Threshold** | 0.60 (optimal via grid scan across 12 symbols) |
 | **Avg Win Rate (retrained pairs)** | 76.9–88.4% across symbols |
-| **Scan Interval** | Every 5 minutes (daemon) |
-| **Open Positions** | 0 (fresh start after architecture update) |
+| **Scan Interval** | Every 5 minutes (daemon — synced to bar boundaries :00/:05/:10/...) |
+| **Open Positions** | 0 (fresh start — deferred entry flow enabled) |
 
 ### Active Pairs
 
@@ -53,11 +53,12 @@
 - **Staged entries** — 2–3 tranches for larger positions
 - **10x leverage max** on testnet; Kelly‑fractional automatic position sizing
 
-### Production‑Grade Tooling
+### Production-Grade Tooling
 - **Binance Testnet Integration** — real order execution on paper environment with accurate fee & slippage modeling
-- **Telegram Reporting** — automated reports every 5-minute daemon cycle via Telegram bot
+- **Deferred Entry Flow** — signals computed at candle N close, entries executed at candle N+1 close via `pending_signals` DB table. Ensures backtest ↔ live trader alignment.
+- **Telegram Reporting** — automated reports every 5-minute daemon cycle (synced to bar boundaries :00/:05/:10) via Telegram bot
 - **Daemon-Based Execution** — autonomous signal scan every 5 minutes via persistent trading daemon (see `scripts/trading/`)
-- **SQLite Persistence** — trade log, capital history, signal records
+- **SQLite Persistence** — trade log, capital history, signal records, pending signals
 - **CI/CD Pipeline** — GitHub Actions with linting, testing, security scan, and pre‑deploy validation
 
 ---
@@ -66,11 +67,13 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                     Daemon Loop (5min cycle)                       │
-│          ┌──────────────────────────┐                             │
-│          │ Signal Scan (every 5min)  │                             │
-│          │ → engine.py runs cycle    │                             │
-│          └──────────┬───────────────┘                             │
+│                     Daemon Loop (5min cycle — synced to bar boundaries)               │
+│          ┌──────────────────────────────────────────┐                                │
+│          │ 1. Execute pending entries (from candle N)│                                │
+│          │ 2. Exit positions due (hold_expiry)       │                                │
+│          │ 3. Compute signals for candle N+1         │                                │
+│          │    → store as pending for next cycle      │                                │
+│          └──────────┬───────────────────────────────┘                                │
 │          ┌──────────────────────────┐                             │
 │          │ Cron Monitoring (hourly)  │  ← akan jadi daily         │
 │          │ → auto_retrain.py        │                             │

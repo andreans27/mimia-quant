@@ -58,7 +58,7 @@ LIVE_SYMBOLS = [
 
 # Trading parameters (from optimal backtest sweep)
 THRESHOLD = 0.60
-HOLD_BARS = 9       # Hold position for ~45 min (9 × 5m)
+HOLD_BARS = 9       # Hold position for ~45 min (9 x 5m)
 COOLDOWN_BARS = 3   # Wait 15 min between trades
 POSITION_PCT = 0.15 # Risk 15% of capital per trade (deprecated — use MARGIN_PCT * LEVERAGE)
 MARGIN_PCT = 0.01   # 1% of total balance per position
@@ -75,7 +75,7 @@ FETCH_DAYS = 130
 # Telegram reporting
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 if not TELEGRAM_BOT_TOKEN:
-    print("⚠️  WARNING: TELEGRAM_BOT_TOKEN not set — Telegram reporting disabled")
+    print("WARNING: TELEGRAM_BOT_TOKEN not set — Telegram reporting disabled")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "766684679")
 
 
@@ -128,6 +128,14 @@ def init_db():
             timestamp INTEGER NOT NULL,
             capital REAL NOT NULL,
             peak_capital REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS pending_signals (
+            symbol TEXT PRIMARY KEY,
+            signal INTEGER NOT NULL DEFAULT 0,
+            proba REAL NOT NULL DEFAULT 0.0,
+            timestamp INTEGER NOT NULL DEFAULT 0,
+            bar_index TEXT
         );
 
         CREATE TABLE IF NOT EXISTS live_runs (
@@ -267,9 +275,61 @@ def reset_state():
     c.execute("UPDATE live_state SET position=0, entry_price=0, entry_time=0, "
               "entry_proba=0, hold_remaining=0, cooldown_remaining=0, qty=0")
     c.execute("DELETE FROM live_signals")
+    c.execute("DELETE FROM pending_signals")
     c.execute("DELETE FROM live_capital")
     c.execute("INSERT INTO live_capital (timestamp, capital, peak_capital) VALUES (?, ?, ?)",
               (int(time.time() * 1000), INITIAL_CAPITAL, INITIAL_CAPITAL))
     conn.commit()
     conn.close()
-    print("✅ State reset. All positions set to flat, capital reset to $5000.")
+    print("State reset. All positions set to flat, capital reset to $5000.")
+
+
+# ─── Pending Signals (Deferred Entry — Candle N → Candle N+1) ───────
+
+def save_pending_signals(conn, signals: Dict[str, Dict]):
+    """Save pending signals to DB for deferred execution.
+
+    Signals generated at candle N close are stored here and executed
+    at candle N+1 close. This ensures backtest <-> live alignment.
+
+    signals dict: {symbol: {'signal': int, 'proba': float, 'timestamp': ms, 'bar_index': str}}
+    """
+    c = conn.cursor()
+    for symbol, sig in signals.items():
+        s = sig.get('signal', 0)
+        p = sig.get('proba', 0.0)
+        ts = sig.get('timestamp', int(time.time() * 1000))
+        bi = sig.get('bar_index', '')
+        c.execute("""
+            INSERT INTO pending_signals (symbol, signal, proba, timestamp, bar_index)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
+                signal=excluded.signal, proba=excluded.proba,
+                timestamp=excluded.timestamp, bar_index=excluded.bar_index
+        """, (symbol, s, p, ts, bi))
+    conn.commit()
+
+
+def load_pending_signals(conn) -> Dict[str, Dict]:
+    """Load all pending signals from DB.
+
+    Returns dict of {symbol: {'signal': int, 'proba': float, 'timestamp': ms, 'bar_index': str}}
+    """
+    c = conn.cursor()
+    c.execute("SELECT symbol, signal, proba, timestamp, bar_index FROM pending_signals WHERE signal != 0")
+    signals = {}
+    for row in c.fetchall():
+        signals[row[0]] = {
+            'signal': row[1],
+            'proba': row[2],
+            'timestamp': row[3] or 0,
+            'bar_index': row[4] or '',
+        }
+    return signals
+
+
+def clear_pending_signals(conn):
+    """Clear all pending signals after execution."""
+    c = conn.cursor()
+    c.execute("DELETE FROM pending_signals")
+    conn.commit()

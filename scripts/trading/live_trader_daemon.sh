@@ -32,20 +32,21 @@ cleanup() {
 }
 trap cleanup SIGTERM SIGINT
 
-# ── Initial bar-boundary sync ───────────────────────────────────────
-# Wait until the next 5m bar boundary (:00, :05, :10, :15...)
-# This ensures the first evaluation uses a finalized bar.
-sync_to_bar_boundary() {
-    local now_epoch
-    now_epoch=$(date +%s)
-    # Next 5-minute boundary
-    local next_boundary=$(( ((now_epoch + 299) / 300) * 300 ))
-    local sleep_sec=$(( next_boundary - now_epoch + 5 ))  # +5s buffer
-    if [ "$sleep_sec" -gt 0 ] && [ "$sleep_sec" -lt 300 ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⏳ Syncing to bar boundary: sleeping ${sleep_sec}s..." | tee -a "$LOG_FILE"
-        sleep "$sleep_sec"
-    fi
-}
+    # ── Initial bar-boundary sync ───────────────────────────────────────
+    # Wait until the next 5m bar boundary (:00, :05, :10, :15...)
+    # This ensures the first evaluation uses a finalized bar.
+    # Buffer reduced to 1s (was 5s) — OHLCV from fapi.binance.com settles quickly.
+    sync_to_bar_boundary() {
+        local now_epoch
+        now_epoch=$(date +%s)
+        # Next 5-minute boundary
+        local next_boundary=$(( ((now_epoch + 299) / 300) * 300 ))
+        local sleep_sec=$(( next_boundary - now_epoch + 1 ))  # +1s buffer
+        if [ "$sleep_sec" -gt 0 ] && [ "$sleep_sec" -lt 300 ]; then
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⏳ Syncing to bar boundary: sleeping ${sleep_sec}s..." | tee -a "$LOG_FILE"
+            sleep "$sleep_sec"
+        fi
+    }
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Daemon started (PID: $$) — Mode: $MODE" | tee -a "$LOG_FILE"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Interval: ${INTERVAL}s (5m) — Synced to bar boundaries" | tee -a "$LOG_FILE"
