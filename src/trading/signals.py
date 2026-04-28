@@ -220,7 +220,10 @@ class SignalGenerator:
         """Fetch live 5m data and compute all features for inference."""
         from src.strategies.ml_features import compute_5m_features_5tf
 
-        # Map 1000x symbols to spot symbols for OHLCV (Binance Spot API)
+        # BUG FIX: Jangan strip 1000 prefix untuk Futures API!
+        # fapi.binance.com menggunakan 1000PEPEUSDT sebagai symbol, BUKAN PEPEUSDT.
+        # Spot API mapping tidak relevan karena kita pakai Futures API di semua path.
+        # spot_symbol hanya untuk display/logging.
         spot_symbol = symbol
         if symbol.startswith("1000"):
             for prefix in ["1000", "10000", "100000"]:
@@ -229,8 +232,9 @@ class SignalGenerator:
                     break
 
         try:
-            print(f"    📡 Loading OHLCV data for {symbol} (Spot: {spot_symbol})...")
-            df_5m = self._ensure_ohlcv_data(spot_symbol)
+            print(f"    📡 Loading OHLCV data for {symbol}...")
+            # GUNAKAN symbol ASLI (1000PEPEUSDT) untuk Futures API!
+            df_5m = self._ensure_ohlcv_data(symbol)
             if df_5m is None or len(df_5m) < 500:
                 print(f"    ⚠️ Insufficient data for {symbol} (got {len(df_5m) if df_5m is not None else 0} rows)")
                 return None
@@ -306,16 +310,8 @@ class SignalGenerator:
             dict with keys: proba, signal (1=long, -1=short, 0=flat),
             previous_proba, or None if error
         """
-        # Handle 1000x symbols -> use spot symbol for OHLCV
-        spot_symbol = symbol
-        if symbol.startswith("1000"):
-            # Map to spot symbol (e.g., 1000PEPEUSDT -> PEPEUSDT)
-            for prefix in ["1000", "10000", "100000"]:
-                if symbol.startswith(prefix):
-                    remainder = symbol[len(prefix):]
-                    spot_symbol = remainder
-                    break
-
+        # BUG FIX: Jangan strip 1000 prefix — Futures API menggunakan symbol ASLI!
+        # Cache file juga menggunakan nama symbol asli (1000PEPEUSDT_5m.parquet)
         try:
             cached = self._load_models(symbol)
             if cached is None:

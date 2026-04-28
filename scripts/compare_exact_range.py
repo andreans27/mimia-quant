@@ -114,9 +114,8 @@ def simulate_bt(symbol: str, initial_state: dict = None) -> dict:
     prob_stack = np.column_stack([group_probs[tf] for tf in group_probs])
     probas = pd.Series(np.mean(prob_stack, axis=1), index=feat_df.index)
     
-    # Fetch OHLCV prices
-    spot = symbol[4:] if symbol.startswith("1000") else symbol
-    df_p = gen._ensure_ohlcv_data(spot)
+    # Fetch OHLCV prices — GUNAKAN symbol ASLI (1000PEPEUSDT, bukan PEPEUSDT)
+    df_p = gen._ensure_ohlcv_data(symbol)
     if df_p is None:
         return None
     

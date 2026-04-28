@@ -885,8 +885,9 @@ class LiveTrader:
         try:
             from src.strategies.ml_features import OHLCV_CACHE_DIR
             for sym in LIVE_SYMBOLS[:1]:  # Check first symbol as reference
-                spot = sym[4:] if sym.startswith("1000") else sym
-                cache = OHLCV_CACHE_DIR / f"{spot}_5m.parquet"
+                # GUNAKAN symbol ASLI — cache sekarang pakai nama Futures symbol
+                # (misal 1000PEPEUSDT_5m.parquet, BUKAN PEPEUSDT_5m.parquet)
+                cache = OHLCV_CACHE_DIR / f"{sym}_5m.parquet"
                 if cache.exists():
                     df = pd.read_parquet(cache)
                     latest_ts = df.index[-1]

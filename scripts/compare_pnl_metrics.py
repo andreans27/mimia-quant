@@ -34,10 +34,9 @@ from src.trading.state import (
 from src.strategies.ml_features import OHLCV_CACHE_DIR
 
 
-def compute_probas(symbol: str, hours: int = 36) -> pd.Series:
+def compute_probas(symbol: str, hours: int = 24) -> Optional[pd.Series]:
     """Compute model proba for every bar in the time window."""
     gen = SignalGenerator(symbol)
-    spot = symbol[4:] if symbol.startswith("1000") else symbol
     
     cached = gen._load_models(symbol)
     if cached is None:
@@ -320,10 +319,9 @@ def main():
             if probas is None: 
                 print(f"\n  ⚠️ {sym}: No proba data"); continue
             
-            # Fetch OHLCV prices
+            # Fetch OHLCV prices — GUNAKAN symbol ASLI (1000PEPEUSDT, bukan PEPEUSDT)
             gen = SignalGenerator(sym)
-            spot = sym[4:] if sym.startswith("1000") else sym
-            df_p = gen._ensure_ohlcv_data(spot)
+            df_p = gen._ensure_ohlcv_data(sym)
             if df_p is None:
                 print(f"\n  ⚠️ {sym}: No price data"); continue
             
