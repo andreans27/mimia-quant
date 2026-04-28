@@ -576,8 +576,6 @@ class LiveTrader:
         pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
         # Calculate unrealized PnL from open positions
-        # capital (total_margin_balance) = wallet_balance + unrealized_pnl
-        # wallet_balance ≈ INITIAL_CAPITAL + realized_pnl
         wallet_balance = INITIAL_CAPITAL + realized_pnl
         unrealized_pnl = capital - wallet_balance
 
@@ -585,6 +583,10 @@ class LiveTrader:
         running_positions = []
         c.execute("SELECT symbol, position FROM live_state WHERE position != 0")
         db_open = {sym: pos for sym, pos in c.fetchall()}
+
+        # Get pending signals count
+        c.execute("SELECT COUNT(*) FROM pending_signals WHERE signal != 0")
+        pending_count = c.fetchone()[0] or 0
 
         # Try to get per-position unrealized PnL from Binance
         pos_unrealized = {}
@@ -610,6 +612,18 @@ class LiveTrader:
             else:
                 running_positions.append(f"  {icon} {sym}: {label}")
 
+        # Add pending signals to report
+        pending_line = ""
+        if pending_count > 0:
+            c.execute("SELECT symbol, signal, proba FROM pending_signals WHERE signal != 0")
+            pending_list = []
+            for sym, sig, proba in c.fetchall():
+                d = 'LONG' if sig == 1 else 'SHORT'
+                pending_list.append(f"  ⏳ {sym}: {d} ({proba:.3f})")
+            pending_line = f"\n*Pending Signals ({pending_count})*\n" + "\n".join(pending_list[:5]) + "\n"
+            if pending_count > 5:
+                pending_line += f"  ... (+{pending_count-5} more)\n"
+
         msg = (
             f"📊 *Mimia Live Trade Report*\n"
             f"`{now}`\n\n"
@@ -633,6 +647,9 @@ class LiveTrader:
         if running_positions:
             msg += f"*Open Positions ({len(running_positions)})*\n"
             msg += "\n".join(running_positions) + "\n\n"
+
+        if pending_line:
+            msg += pending_line + "\n"
 
         if trade_lines:
             msg += f"*Recent Trades ({len(trade_lines)})*\n"
@@ -759,6 +776,16 @@ class LiveTrader:
         save_state(self.conn, states)
         print(f"  ✅ Phase 2 complete: {trades_closed} exits executed")
 
+        # ── 📡 QUICK REPORT ────────────────────────────────────────
+        # Kirim Telegram report SEKARANG — setelah Phase 1+2 (cepat, <5s)
+        # Phase 3 (signal computation) makan ~130s — tidak perlu ditunggu
+        exec_ms_quick = int((time.time() - start_time) * 1000)
+        dd = (peak_capital - capital) / peak_capital * 100 if peak_capital > 0 else 0
+        msg = self._build_report(capital, peak_capital, dd, trades_opened,
+                                 trades_closed, trade_report_lines)
+        self.send_telegram(msg)
+        # ───────────────────────────────────────────────────────────
+
         # ════════════════════════════════════════════════════════════════
         # Phase 3: Compute NEW signals for current cycle
         #   Store as pending → will be executed at candle N+2 close
@@ -811,16 +838,12 @@ class LiveTrader:
         print(f"  Phase 1 (pending entries): {trades_opened} entries executed from prev cycle")
         print(f"  Phase 2 (exits):           {trades_closed} positions closed")
         print(f"  Phase 3 (new signals):     {pending_sig} signals stored as pending for next cycle")
-        print(f"  Execution:                 {exec_ms}ms")
+        print(f"  Execution:                 {exec_ms}ms (report sent after Phase 1+2)")
         print(f"  Capital: ${capital:.2f} | Peak: ${peak_capital:.2f} | DD: {dd:.2f}%")
         print(f"  Pending signals stored:    {signals_total} total, {len(new_signals)} actionable")
 
         log_run(self.conn, exec_ms, signals_total, trades_opened,
                 trades_closed, capital, peak_capital, dd)
-
-        msg = self._build_report(capital, peak_capital, dd, trades_opened,
-                                 trades_closed, trade_report_lines)
-        self.send_telegram(msg)
 
         return capital, peak_capital, dd
 
