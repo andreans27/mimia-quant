@@ -901,70 +901,70 @@ class LiveTrader:
         order_placed = False
         executed_qty_actual = 0.0
 
-        # Step 2: Calculate limit price — match backtest bar close + slippage
+        # Step 2: Calculate target price — match backtest bar close + slippage
         if direction == 1:
-            limit_price = price_ref * (1 + SLIPPAGE)  # Slightly above close for buy
+            target_price = price_ref * (1 + SLIPPAGE)
         else:
-            limit_price = price_ref * (1 - SLIPPAGE)  # Slightly below close for sell
+            target_price = price_ref * (1 - SLIPPAGE)
 
-        print(f"    📡 LIMIT ORDER: {side} {symbol} qty={qty:.6f} @ ${limit_price:.4f} (based on bar close ${price_ref:.4f})")
-
+        # Round price to exchange tick_size
+        tick_size = 0.01
         try:
-            # Place LIMIT order first (matches backtest entry price)
-            order_resp = client.place_order(
-                symbol=symbol,
-                side=side,
-                order_type="LIMIT",
-                time_in_force="GTC",
-                price=limit_price,
-                quantity=qty,
-            )
-            order_id = order_resp.get('order_id')
-            if order_id is None or order_id == '?':
-                order_id = order_resp.get('client_order_id')
-            status_code = order_resp.get('status', 'N/A')
+            exch_info = client.get_exchange_info()
+            if isinstance(exch_info, dict):
+                for sym_info in exch_info.get('symbols', []):
+                    if sym_info.get('symbol') == symbol.upper():
+                        for f in sym_info.get('filters', []):
+                            if f.get('filter_type') == 'PRICE_FILTER':
+                                tick_size = float(f.get('tick_size', 0.01))
+                                break
+                        break
+        except Exception:
+            pass
+        # Round price to tick_size precision
+        prec = 4  # default precision
+        if tick_size > 0:
+            target_price = round(target_price / tick_size) * tick_size
+            tick_str = f"{tick_size}".rstrip('0').rstrip('.')
+            prec = len(tick_str.split('.')[1]) if '.' in tick_str else 0
+            target_price = round(target_price, prec)
 
-            # Poll for fill (up to 10 attempts, 1s apart = 10s max wait)
-            for attempt in range(10):
-                time.sleep(1)
-                try:
-                    fill_resp = client.get_order(symbol=symbol, order_id=order_id)
-                    if isinstance(fill_resp, dict):
-                        fill_status = fill_resp.get('status', '')
-                        ex_qty = float(fill_resp.get('executed_qty', 0))
-                        avg_px = float(fill_resp.get('avg_price', 0))
-                        if fill_status == 'FILLED' and ex_qty > 0 and avg_px > 0:
-                            entry_price = avg_px
-                            executed_qty_actual = ex_qty
-                            order_placed = True
-                            print(f"    📡 LIMIT FILLED: {side} {symbol} qty={ex_qty:.6f} @ ${avg_px:.4f} (order #{order_id})")
-                            break
-                except Exception:
-                    pass
+        limit_price = target_price
 
-            # If LIMIT not filled, cancel and use MARKET as fallback
-            if not order_placed:
-                try:
-                    client.cancel_order(symbol=symbol, order_id=order_id)
-                    print(f"    ⏳ LIMIT not filled, canceling order #{order_id}")
-                except Exception:
-                    pass
+        print(f"    📡 LIMIT ORDER: {side} {symbol} qty={qty:.6f} @ ${limit_price:.{prec}f} (based on bar close ${price_ref:.4f})")
 
-                print(f"    ⏩ MARKET fallback: {side} {symbol} qty={qty:.6f}")
-                market_resp = client.place_order(
-                    symbol=symbol,
-                    side=side,
-                    order_type="MARKET",
-                    quantity=qty,
-                )
-                mkt_order_id = market_resp.get('order_id')
-                if mkt_order_id is None or mkt_order_id == '?':
-                    mkt_order_id = market_resp.get('client_order_id')
+        # ── Try LIMIT first, then MARKET, then simulated ──
+        # (don't let LIMIT precision errors skip MARKET fallback)
+        for attempt_type in ['LIMIT', 'MARKET']:
+            try:
+                if attempt_type == 'LIMIT':
+                    order_resp = client.place_order(
+                        symbol=symbol,
+                        side=side,
+                        order_type="LIMIT",
+                        time_in_force="GTC",
+                        price=limit_price,
+                        quantity=qty,
+                    )
+                else:
+                    order_resp = client.place_order(
+                        symbol=symbol,
+                        side=side,
+                        order_type="MARKET",
+                        quantity=qty,
+                    )
 
-                for attempt in range(6):
+                order_id = order_resp.get('order_id')
+                if order_id is None or order_id == '?':
+                    order_id = order_resp.get('client_order_id')
+                status_code = order_resp.get('status', 'N/A')
+
+                # Poll for fill
+                max_attempts = 10 if attempt_type == 'LIMIT' else 6
+                for poll in range(max_attempts):
                     time.sleep(1)
                     try:
-                        fill_resp = client.get_order(symbol=symbol, order_id=mkt_order_id)
+                        fill_resp = client.get_order(symbol=symbol, order_id=order_id)
                         if isinstance(fill_resp, dict):
                             fill_status = fill_resp.get('status', '')
                             ex_qty = float(fill_resp.get('executed_qty', 0))
@@ -973,63 +973,57 @@ class LiveTrader:
                                 entry_price = avg_px
                                 executed_qty_actual = ex_qty
                                 order_placed = True
-                                print(f"    📡 MARKET FILLED: {side} {symbol} qty={ex_qty:.6f} @ ${avg_px:.4f}")
+                                print(f"    📡 {attempt_type} FILLED: {side} {symbol} qty={ex_qty:.6f} @ ${avg_px:.4f}")
                                 break
                     except Exception:
                         pass
-                # Fallback 1: use account_information_v2 which has REAL entry_price field
-                # (unlike get_position_info() which reports notional = mark_price × amt)
+
+                if order_placed:
+                    break  # Order placed successfully
+
+                # Cancel un-filled LIMIT before trying MARKET
+                if attempt_type == 'LIMIT':
+                    try:
+                        client.cancel_order(symbol=symbol, order_id=order_id)
+                        print(f"    ⏳ LIMIT not filled, canceled order #{order_id}")
+                    except Exception:
+                        pass
+                    print(f"    ⏩ MARKET fallback: {side} {symbol} qty={qty:.6f}")
+
+            except Exception as e:
+                print(f"    ⚠️ {attempt_type} order failed: {e}")
+                if attempt_type == 'MARKET':
+                    # MARKET also failed — use simulated fallback
+                    break
+
+        # ── Post-order verification ──
+        if not order_placed:
+            # Final check: does Binance show an open position?
+            try:
                 time.sleep(1)
-                try:
-                    acct = client._call('account_information_v2')
-                    for pos in acct.positions:
-                        if getattr(pos, 'symbol', '') == symbol.upper():
-                            pos_amt = float(getattr(pos, 'position_amt', 0) or 0)
-                            ep = float(getattr(pos, 'entry_price', 0) or 0)
-                            if abs(pos_amt) > 0.0001 and ep > 0:
-                                entry_price = ep
-                                executed_qty_actual = abs(pos_amt)
-                                order_placed = True
-                                print(f"    📡 ORDER FILLED (acct_info_v2): {side} {symbol} qty={abs(pos_amt):.4f} @ ${ep:.4f}")
-                                break
-                except Exception:
-                    pass
+                positions = client.get_position_info()
+                for p in positions:
+                    if p.get('symbol') == symbol.upper():
+                        pos_amt = float(p.get('position_amt', 0))
+                        if abs(pos_amt) > 0.0001:
+                            entry_price = float(p.get('entry_price', 0) or 0)
+                            if entry_price <= 0:
+                                entry_price = abs(float(p.get('notional', 0)) / pos_amt) if pos_amt != 0 else 0
+                            executed_qty_actual = abs(pos_amt)
+                            order_placed = True
+                            print(f"    📡 POSITION FOUND (post-check): {side} {symbol} qty={abs(pos_amt):.4f} @ ${entry_price:.4f}")
+                            break
+            except Exception:
+                pass
 
-            if not order_placed:
-                # Fallback 2: check position info on Binance (notional = mark×amt, last resort)
-                time.sleep(1)
-                actual_pos = None
-                try:
-                    positions = client.get_position_info()
-                    for p in positions:
-                        if p.get('symbol') == symbol.upper():
-                            pos_amt = float(p.get('position_amt', 0))
-                            if abs(pos_amt) > 0.0001:
-                                actual_pos = p
-                                break
-                except Exception:
-                    pass
+        if not order_placed:
+            # Genuine failure — skip this trade entirely
+            print(f"    ❌ ORDER FAILED: {side} {symbol} qty={qty:.6f} — no position on Binance")
+            print(f"    → Trade SKIPPED (state NOT updated)")
+            return None
 
-                if actual_pos is not None:
-                    pos_amt = float(actual_pos.get('position_amt', 0))
-                    notional = float(actual_pos.get('notional', 0))
-                    entry_price = abs(notional / pos_amt) if pos_amt != 0 else price_ref
-                    executed_qty_actual = pos_amt
-                    order_placed = True
-                    print(f"    ⚠️ ORDER FILLED (position-fallback, notional/amt): {side} {symbol} {pos_amt:.4f} @ ${entry_price:.4f}")
-                else:
-                    # Genuinely not filled — use orderbook price
-                    entry_price = price_ref * (1 + SLIPPAGE) if direction == 1 else price_ref * (1 - SLIPPAGE)
-                    print(f"    📡 ORDER SUBMITTED (pending): {side} {symbol} order #{order_id} status={status_code} — using orderbook price ${entry_price:.4f}")
-        except Exception as e:
-            print(f"    ⚠️ Binance order failed (fallback): {e}")
-            # Simulated fallback: use orderbook price with slippage
-            entry_price = price_ref * (1 + SLIPPAGE) if direction == 1 else price_ref * (1 - SLIPPAGE)
-
-        # Use actual executed qty from Binance when available
+        # ── Order placed successfully: update state ──
         final_qty = executed_qty_actual if executed_qty_actual > 0 else qty
-
-        # Apply fee using actual fill data
         entry_cost = entry_price * final_qty * TAKER_FEE
 
         state['position'] = direction
@@ -1040,7 +1034,6 @@ class LiveTrader:
         state['cooldown_remaining'] = 0
         state['qty'] = final_qty
 
-        # Deduct entry fee from capital
         capital -= entry_cost
         peak_capital = max(peak_capital, capital)
 
