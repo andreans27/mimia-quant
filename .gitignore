@@ -118,6 +118,7 @@ data/*.txt
 # Debug scripts
 debug_*.py
 tmp_guardian_check*.py
+scripts/_guardian_*.py
 scripts/trading/oos_*.py
 scripts/compare_backtest_live*.py
 scripts/operations/guardian_report_final.py
