@@ -144,14 +144,14 @@ def resample_to_timeframes(
     }
     
     result = {'5m': df_5m.copy()}
-    
+
     for name in intervals:
         if name == '5m':
             continue
         rule = rule_map.get(name)
         if rule is None:
             continue
-        
+
         # Proper OHLCV resample — NOT interpolation
         resampled = df_5m.resample(rule).agg({
             'open': 'first',
@@ -160,11 +160,24 @@ def resample_to_timeframes(
             'close': 'last',
             'volume': 'sum',
         }).dropna()
-        
+
         # Ensure OHLC consistency: low <= open, close <= high
         resampled['low'] = resampled[['open', 'close', 'low']].min(axis=1)
         resampled['high'] = resampled[['open', 'close', 'high']].max(axis=1)
-        
+
+        # CRITICAL FIX: Drop the LAST bar of each higher TF if it may be incomplete.
+        # Pandas resample creates a bar as soon as ANY data in that window exists.
+        # At inference time, e.g. at 14:30, the 4h bar 12:00-16:00 contains only
+        # 5m data from 12:00-14:30 — its close/volume is NOT final.
+        # This causes features to change each time new 5m data arrives!
+        # Only drop when the last bar end time > the LAST timestamp in df_5m
+        # (meaning the bar window extends beyond available data).
+        last_ts = df_5m.index[-1]
+        bar_end = resampled.index[-1] + pd.Timedelta(rule)
+        if bar_end > last_ts:
+            # Last bar is incomplete — drop it
+            resampled = resampled.iloc[:-1]
+
         result[name] = resampled
     
     return result
@@ -349,7 +362,13 @@ def compute_5m_features_5tf(
     idx_5m = feats_5m.index
     
     # Resample limits: max bars until next candle of that TF closes
+    # At inference time, increased limits to bridge gaps from dropped incomplete bars
     fill_limits = {'15m': 3, '30m': 6, '1h': 12, '4h': 48, '2h': 24, '10m': 2}
+    if for_inference:
+        # Increase 4h limit to 96 (8h) — last complete 4h bar may be 2 periods back
+        # when the current incomplete bar is dropped
+        fill_limits['4h'] = 96
+        fill_limits['1h'] = 24
     feat_list = [feats_5m]
     
     for name, df_feat in other_feats.items():
@@ -360,8 +379,28 @@ def compute_5m_features_5tf(
     combined = pd.concat(feat_list, axis=1)
     
     # Step 4: Cross-timeframe features (aligned to 5m)
-    close_5m = df_5m['close'].astype(float)
-    volume_5m = df_5m['volume'].astype(float)
+    # CRITICAL: Truncate df_5m to only include data where ALL TFs have completed bars.
+    # Without this, cross-TF features like vol_1h_avg use RESAMPLED values that
+    # include bars AFTER the current point, leading to unstable feature values.
+    # At inference time, we find the last bar where all TF features are avail (non-NaN)
+    # after forward-fill alignment. Bars beyond this have incomplete higher-TF data.
+    if for_inference:
+        # Find last row with ALL non-NaN values (all TFs have valid data)
+        valid_mask = combined.notna().all(axis=1)
+        if valid_mask.any():
+            last_valid_idx = combined.index[valid_mask][-1]
+            last_pos = combined.index.get_loc(last_valid_idx)
+            df_5m_trunc = df_5m[df_5m.index <= last_valid_idx].copy()
+            # Also truncate combined to avoid NaN in cross-TF calculations
+            combined = combined.iloc[:last_pos + 1].copy()
+            idx_5m = combined.index
+        else:
+            df_5m_trunc = df_5m.copy()
+    else:
+        df_5m_trunc = df_5m.copy()
+    
+    close_5m = df_5m_trunc['close'].astype(float)
+    volume_5m = df_5m_trunc['volume'].astype(float)
     
     # RSI divergence: 5m vs 1h
     rsi_1h_aligned = other_feats['1h']['h1_rsi_14'].reindex(idx_5m, method='ffill', limit=12)
