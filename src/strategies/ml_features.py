@@ -394,24 +394,25 @@ def compute_5m_features_5tf(
     for_inference: bool = False
 ) -> pd.DataFrame:
     """
-    Core feature computation: 5m → resample → compute on ALL TFs → combine.
+    Simplified feature computation: 5m execution + 1h predictive features.
     
-    When for_inference=True: skips target column, keeps the most recent rows
-    (normally dropped because target requires N-bar forward lookahead).
+    Based on MI analysis: only 1h features have predictive power.
+    5m/15m/4h features contribute zero MI — removed to eliminate noise.
     
-    5 timeframes used: 5m, 15m, 30m, 1h, 4h
-    Target: whether close rises in `target_candle` 5m-bars ahead.
+    2 timeframes used: 5m (timing/alignment), 1h (prediction).
+    
+    When for_inference=True: skips target column, keeps most recent rows.
     
     Returns:
-        DataFrame with ~300+ features aligned to 5m index + 'target' column.
+        DataFrame with ~155 features (70 5m + 72 1h + 13 cross-TF) + 'target'.
     """
     if intervals is None:
-        intervals = ['15m', '30m', '1h', '4h']
+        intervals = ['1h']  # Only 1h — 5m/15m/30m/4h had zero MI
     
     # Step 1: Resample 5m to higher timeframes
     tf_data = resample_to_timeframes(df_5m, intervals)
     
-    # Step 2: Compute technical features INDEPENDENTLY on each timeframe
+    # Step 2: Compute technical features on 5m (timing) and 1h (prediction)
     feats_5m = compute_technical_features(tf_data['5m'], prefix='m5_')
     print(f"    Features computed: 5m = {len(feats_5m.columns)}")
     
@@ -419,31 +420,19 @@ def compute_5m_features_5tf(
     for name, df_tf in tf_data.items():
         if name == '5m':
             continue
-        prefix_map = {'15m': 'm15_', '30m': 'm30_', '1h': 'h1_', '4h': 'h4_', '2h': 'h2_', '10m': 'm10_'}
+        prefix_map = {'1h': 'h1_'}
         prefix = prefix_map.get(name, f'{name}_')
         other_feats[name] = compute_technical_features(df_tf, prefix=prefix)
         print(f"    Features computed: {name} = {len(other_feats[name].columns)}")
     
-    # Step 3: Align all to 5m index via forward-fill
+    # Step 3: Align 1h to 5m index via forward-fill
     idx_5m = feats_5m.index
     
-    # Resample limits: max bars until next candle of that TF closes
-    # At inference time, increased limits to bridge gaps from dropped incomplete bars
-    fill_limits = {'15m': 3, '30m': 6, '1h': 12, '4h': 48}
+    fill_limits = {'1h': 12}
     if for_inference:
-        # Increase limits to handle incomplete HTF bars during live inference.
-        # When current HTF bar is incomplete and dropped, forward-fill must
-        # bridge the gap from last COMPLETE bar to the next one.
-        # 15m: gap = full 15m window (6 5m-bars), safe limit=9
-        # 30m: gap = full 30m window (12 5m-bars), safe limit=18
-        # 1h:  gap = full 60m window (24 5m-bars), safe limit=36
-        # 4h:  gap = full 4h window (96 5m-bars), safe limit=120
-        fill_limits['15m'] = 9
-        fill_limits['30m'] = 18
-        fill_limits['1h'] = 36
-        fill_limits['4h'] = 120
-    feat_list = [feats_5m]
+        fill_limits['1h'] = 36  # Bridge gap from incomplete bar
     
+    feat_list = [feats_5m]
     for name, df_feat in other_feats.items():
         limit = fill_limits.get(name, 12)
         aligned = df_feat.reindex(idx_5m, method='ffill', limit=limit)
@@ -451,20 +440,14 @@ def compute_5m_features_5tf(
     
     combined = pd.concat(feat_list, axis=1)
     
-    # Step 4: Cross-timeframe features (aligned to 5m)
-    # CRITICAL: Truncate df_5m to only include data where ALL TFs have completed bars.
-    # Without this, cross-TF features like vol_1h_avg use RESAMPLED values that
-    # include bars AFTER the current point, leading to unstable feature values.
-    # At inference time, we find the last bar where all TF features are avail (non-NaN)
-    # after forward-fill alignment. Bars beyond this have incomplete higher-TF data.
+    # Step 4: Cross-timeframe features (5m ↔ 1h)
     if for_inference:
-        # Find last row with ALL non-NaN values (all TFs have valid data)
+        # Align to last row where all features are non-NaN
         valid_mask = combined.notna().all(axis=1)
         if valid_mask.any():
             last_valid_idx = combined.index[valid_mask][-1]
             last_pos = combined.index.get_loc(last_valid_idx)
             df_5m_trunc = df_5m[df_5m.index <= last_valid_idx].copy()
-            # Also truncate combined to avoid NaN in cross-TF calculations
             combined = combined.iloc[:last_pos + 1].copy()
             idx_5m = combined.index
         else:
@@ -475,91 +458,57 @@ def compute_5m_features_5tf(
     close_5m = df_5m_trunc['close'].astype(float)
     volume_5m = df_5m_trunc['volume'].astype(float)
     
-    # RSI divergence: 5m vs 1h
-    rsi_1h_aligned = other_feats['1h']['h1_rsi_14'].reindex(idx_5m, method='ffill', limit=12)
-    
     xtf = pd.DataFrame(index=idx_5m)
     
-    # Trend regime: 1h SMA relationships
-    for tf_name in ['15m', '30m', '1h', '4h']:
-        if tf_name not in tf_data:
-            continue
-        tf_close = tf_data[tf_name]['close'].astype(float)
-        prefix = {'15m': 'm15_', '30m': 'm30_', '1h': 'h1_', '4h': 'h4_'}[tf_name]
-        
+    # 1h Trend regime
+    if '1h' in tf_data:
+        tf_close = tf_data['1h']['close'].astype(float)
         for period in [20, 50]:
             sma = tf_close.rolling(period).mean()
             trend = pd.Series(0, index=tf_close.index)
-            trend[sma > sma.shift(1)] = 1  # SMA rising
-            trend[sma < sma.shift(1)] = -1  # SMA falling
-            
-            limit = fill_limits.get(tf_name, 12)
-            aligned = trend.reindex(idx_5m, method='ffill', limit=limit)
-            xtf[f'{prefix}trend_sma{period}'] = aligned
+            trend[sma > sma.shift(1)] = 1
+            trend[sma < sma.shift(1)] = -1
+            aligned = trend.reindex(idx_5m, method='ffill', limit=fill_limits.get('1h', 12))
+            xtf[f'h1_trend_sma{period}'] = aligned
     
-    # Volatility ratio: 5m ATR vs 1h ATR
-    atr_5m_aligned = feats_5m['m5_atr_14']
-    atr_1h_aligned = other_feats['1h']['h1_atr_14'].reindex(idx_5m, method='ffill', limit=12)
-    xtf['vol_ratio_5m_vs_1h'] = atr_5m_aligned / atr_1h_aligned.replace(0, np.nan)
-    xtf['vol_ratio_5m_vs_4h'] = atr_5m_aligned / other_feats['4h']['h4_atr_14'].reindex(idx_5m, method='ffill', limit=48).replace(0, np.nan)
-    
-    # RSI divergence
-    rsi_15m_aligned = other_feats['15m']['m15_rsi_14'].reindex(idx_5m, method='ffill', limit=3)
-    rsi_1h_aligned = other_feats['1h']['h1_rsi_14'].reindex(idx_5m, method='ffill', limit=12)
-    rsi_4h_aligned = other_feats['4h']['h4_rsi_14'].reindex(idx_5m, method='ffill', limit=48)
-    
-    xtf['rsi_div_5m_vs_15m'] = feats_5m['m5_rsi_14'] - rsi_15m_aligned
-    xtf['rsi_div_5m_vs_1h'] = feats_5m['m5_rsi_14'] - rsi_1h_aligned
-    xtf['rsi_div_5m_vs_4h'] = feats_5m['m5_rsi_14'] - rsi_4h_aligned
-    
-    # Volume ratio: 5m volume vs 1h avg volume per 5m slice
-    vol_1h_avg = df_5m['volume'].astype(float).rolling(12).sum().resample('1h').mean()
-    vol_1h_avg_aligned = vol_1h_avg.reindex(idx_5m, method='ffill', limit=12)
-    xtf['vol_5m_vs_1h_avg'] = volume_5m / vol_1h_avg_aligned.replace(0, np.nan)
-    
-    # Consolidation detection: is 5m range narrow vs 1h range?
-    range_5m_20 = (tf_data['5m']['high'].astype(float).rolling(20).max() 
-                   - tf_data['5m']['low'].astype(float).rolling(20).min())
-    range_1h_20 = (df_5m['high'].astype(float).resample('1h').max().rolling(20).mean()
-                   - df_5m['low'].astype(float).resample('1h').min().rolling(20).mean())
-    range_1h_20_aligned = range_1h_20.reindex(idx_5m, method='ffill', limit=12)
-    xtf['consolidation_ratio'] = range_5m_20 / range_1h_20_aligned.replace(0, np.nan)
-    xtf['is_consolidating'] = (range_5m_20 < range_5m_20.rolling(40).mean() * 0.5).astype(float)
-    
-    # TF alignment: do all TFs agree on direction?
-    close_15m = tf_data['15m']['close'].astype(float)
-    close_30m = tf_data['30m']['close'].astype(float)
-    close_1h = tf_data['1h']['close'].astype(float)
-    close_4h = tf_data['4h']['close'].astype(float)
-    
-    for tf_name, tf_close in [('15m', close_15m), ('30m', close_30m), ('1h', close_1h), ('4h', close_4h)]:
-        trend_bull = (tf_close > tf_close.rolling(20).mean()).astype(int)
-        limit = fill_limits.get(tf_name, 12)
-        xtf[f'{tf_name}_bullish'] = trend_bull.reindex(idx_5m, method='ffill', limit=limit)
-    
-    # Combined: how many TFs agree?
-    xtf['tf_bullish_count'] = (
-        xtf['15m_bullish'] + xtf['30m_bullish'] + xtf['1h_bullish'] + xtf['4h_bullish']
-    )
+    if '1h' in other_feats:
+        # Volatility ratio: 5m ATR vs 1h ATR
+        atr_1h_aligned = other_feats['1h']['h1_atr_14'].reindex(idx_5m, method='ffill', limit=12)
+        xtf['vol_ratio_5m_vs_1h'] = feats_5m['m5_atr_14'] / atr_1h_aligned.replace(0, np.nan)
+        
+        # RSI divergence 5m vs 1h
+        rsi_1h_aligned = other_feats['1h']['h1_rsi_14'].reindex(idx_5m, method='ffill', limit=12)
+        xtf['rsi_div_5m_vs_1h'] = feats_5m['m5_rsi_14'] - rsi_1h_aligned
+        
+        # Volume ratio
+        vol_1h_avg = df_5m['volume'].astype(float).rolling(12).sum().resample('1h').mean()
+        vol_1h_avg_aligned = vol_1h_avg.reindex(idx_5m, method='ffill', limit=12)
+        xtf['vol_5m_vs_1h_avg'] = volume_5m / vol_1h_avg_aligned.replace(0, np.nan)
+        
+        # Consolidation detection
+        range_5m_20 = (tf_data['5m']['high'].astype(float).rolling(20).max() 
+                       - tf_data['5m']['low'].astype(float).rolling(20).min())
+        range_1h_20 = (df_5m['high'].astype(float).resample('1h').max().rolling(20).mean()
+                       - df_5m['low'].astype(float).resample('1h').min().rolling(20).mean())
+        range_1h_20_aligned = range_1h_20.reindex(idx_5m, method='ffill', limit=12)
+        xtf['consolidation_ratio'] = range_5m_20 / range_1h_20_aligned.replace(0, np.nan)
+        xtf['is_consolidating'] = (range_5m_20 < range_5m_20.rolling(40).mean() * 0.5).astype(float)
+        
+        # 1h bullish alignment
+        close_1h = tf_data['1h']['close'].astype(float)
+        trend_bull = (close_1h > close_1h.rolling(20).mean()).astype(int)
+        xtf['1h_bullish'] = trend_bull.reindex(idx_5m, method='ffill', limit=fill_limits.get('1h', 12))
     
     # ── Combine ALL features ──
     combined = pd.concat([combined, xtf], axis=1)
     
-    # ── Target: 9 bars ahead from ENTRY (deferred), not from signal ──
-    # Signal @ bar N, Entry @ bar N+1 (deferred), Hold 9 bars, Exit @ bar N+10
-    # Target: close[N+10] > close[N+1]  (profitable from entry to exit)
-    # shift(-10) instead of shift(-9) to account for +1 deferred entry
+    # ── Target: aligned with deferred entry ──
     if not for_inference:
         combined['target'] = (close_5m.shift(-(target_candle + 1)) > close_5m.shift(-1)).astype(float)
     
-    # ── Drop NaN rows (need ~200 bars for warmup due to 5m lookback) ──
+    # ── Drop NaN rows ──
     if for_inference:
-        # Keep ALL rows including the most recent ones (no forward-looking target needed)
         combined = combined.iloc[200:].copy()
-        # CRITICAL: Drop last 5m bar if it hasn't closed yet (incomplete data).
-        # A 5m bar at timestamp T closes at T + 5min.
-        # If current_time < T + 5min, the bar's open/high/low/close/volume is NOT final.
-        # Without this check, signal computation uses PARTIAL bar data → unstable probas.
         now = datetime.utcnow()
         last_idx = combined.index[-1]
         incomplete_close = last_idx + timedelta(minutes=5)

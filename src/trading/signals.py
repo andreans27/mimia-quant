@@ -34,6 +34,32 @@ class SignalGenerator:
     def __init__(self, symbol: str):
         self.symbol = symbol
         self._cache: Dict[str, Any] = {}  # symbol -> loaded data
+        self._calibrator: Optional[Dict] = None  # cached calibrator
+
+    def _load_calibrator(self, symbol: str) -> Optional[Dict]:
+        """Load Platt scaling calibrator (cached)."""
+        if self._calibrator is not None:
+            return self._calibrator
+        cal_path = MODEL_DIR / f"{symbol}_calibrator.json"
+        if cal_path.exists():
+            try:
+                with open(cal_path) as f:
+                    self._calibrator = json.load(f)
+                return self._calibrator
+            except Exception:
+                return None
+        return None
+
+    def _apply_calibration(self, raw_proba: float) -> float:
+        """Apply Platt scaling: calibrated = 1/(1+exp(-(coef*raw + intercept)))."""
+        cal = self._load_calibrator(self.symbol)
+        if cal is None:
+            return raw_proba
+        # Logistic function: 1 / (1 + exp(-z)) where z = coef * raw + intercept
+        z = cal['coef'] * raw_proba + cal['intercept']
+        calibrated = 1.0 / (1.0 + np.exp(-z))
+        # Clip to [0, 1]
+        return float(np.clip(calibrated, 0.0, 1.0))
 
     def _fetch_5m_ohlcv(self, symbol: str, days: int = FETCH_DAYS) -> Optional[pd.DataFrame]:
         """Fetch 5m OHLCV from Binance public API (faster than testnet)."""
@@ -210,7 +236,7 @@ class SignalGenerator:
             if models:
                 group_models[tf] = models
 
-        if len(group_models) < 2:
+        if len(group_models) < 1:  # Need at least 1 TF group (was 2, now just 'full')
             return None
 
         fresh_features = self._compute_fresh_features(symbol)
@@ -350,10 +376,12 @@ class SignalGenerator:
                 if tf_probs:
                     group_probs.append(np.mean(tf_probs))
 
-            if len(group_probs) < 2:
+            if len(group_probs) < 1:  # Only 1 TF group now ('full')
                 return None
 
             proba = float(np.mean(group_probs))
+            # Apply Platt scaling calibration (spreads narrow raw probas to [0,1])
+            proba = self._apply_calibration(proba)
 
             # Get previous bar proba for cross detection
             prev_proba = None
@@ -373,7 +401,7 @@ class SignalGenerator:
                             tf_probs.append(probs[0])
                     if tf_probs:
                         prev_group_probs.append(np.mean(tf_probs))
-                if len(prev_group_probs) >= 2:
+                if len(prev_group_probs) >= 1:
                     prev_proba = float(np.mean(prev_group_probs))
 
             # Determine signal: level-based (align with backtest)

@@ -51,8 +51,8 @@ STATUS_FILE = MODEL_DIR / "_retrain_status.json"
 SYMBOLS_10 = LIVE_SYMBOLS  # Use all 20 live trading symbols
 
 SEEDS = [42, 101, 202, 303, 404]
-TF_GROUPS = ['full', 'm15', 'm30', 'h1', 'h4']
-TFS = {'full': [], 'm15': ['15m'], 'm30': ['30m'], 'h1': ['1h'], 'h4': ['4h']}
+TF_GROUPS = ['full']    # Only full ensemble — 15m/30m/4h had zero MI
+TFS = {'full': []}       # 'full' uses ALL available features
 
 DAYS_DATA = 130
 WARMUP_BARS = 200
@@ -393,6 +393,90 @@ def backup_old_models(symbol: str):
     return backup_dir
 
 
+# ─── Calibration ────────────────────────────────────────────────
+
+def _calibrate_ensemble(symbol: str, feat_df: pd.DataFrame) -> None:
+    """
+    Fit Platt scaling on validation set for the full ensemble.
+    
+    Steps:
+    1. Split feat_df 70/15/15 (same as training)
+    2. Load all 25 models
+    3. Get ensemble predictions on validation set
+    4. Fit logistic regression calibrator
+    5. Save calibrator to {symbol}_calibrator.json
+    
+    This calibrator is loaded during inference (signals.py, backtest.py)
+    to spread narrow proba range to [0, 1].
+    """
+    from src.trading.signals import SignalGenerator
+    from sklearn.linear_model import LogisticRegression
+    import json
+    from pathlib import Path
+    
+    # 1. Split data
+    n = len(feat_df)
+    train_size = int(n * 0.7)
+    val_size = int(n * 0.15)
+    
+    X_all = feat_df.drop(columns=['target'])
+    y_all = feat_df['target']
+    
+    X_val = X_all.iloc[train_size:train_size + val_size]
+    y_val = y_all.iloc[train_size:train_size + val_size]
+    
+    # 2. Load models and get ensemble predictions on validation set
+    gen = SignalGenerator(symbol)
+    cached = gen._load_models(symbol)
+    if cached is None:
+        raise ValueError(f"No models loaded for {symbol}")
+    
+    groups = cached['groups']
+    
+    # Get all model predictions on validation set
+    all_preds = []
+    for tg, models in groups.items():
+        for seed, m, mf in models:
+            available = [c for c in mf if c in X_val.columns]
+            if len(available) < 5:
+                continue
+            X_sub = X_val[available].fillna(0).clip(-10, 10).values
+            probs = m.predict_proba(X_sub)[:, 1]
+            all_preds.append(probs)
+    
+    if len(all_preds) < 3:  # Need at least 3 models (was 10, now only 5 total)
+        raise ValueError(f"Only {len(all_preds)} models available (need ≥10)")
+    
+    # 3. Ensemble average = raw proba
+    raw_probas = np.mean(all_preds, axis=0)
+    
+    # 4. Fit Platt calibrator
+    calibrator = LogisticRegression(C=1e10, solver='lbfgs')
+    calibrator.fit(raw_probas.reshape(-1, 1), y_val.values)
+    
+    # Evaluate
+    cal_probas = calibrator.predict_proba(raw_probas.reshape(-1, 1))[:, 1]
+    raw_auc = __import__('sklearn').metrics.roc_auc_score(y_val, raw_probas)
+    cal_auc = __import__('sklearn').metrics.roc_auc_score(y_val, cal_probas)
+    status(f"Calibration: raw AUC={raw_auc:.4f} → cal AUC={cal_auc:.4f}, "
+           f"raw range=[{raw_probas.min():.4f},{raw_probas.max():.4f}] "
+           f"→ cal range=[{cal_probas.min():.4f},{cal_probas.max():.4f}]", symbol)
+    
+    # 5. Save
+    cal_data = {
+        'type': 'platt',
+        'coef': float(calibrator.coef_[0][0]),
+        'intercept': float(calibrator.intercept_[0]),
+        'raw_range': [float(raw_probas.min()), float(raw_probas.max())],
+        'cal_range': [float(cal_probas.min()), float(cal_probas.max())],
+        'val_size': len(y_val),
+    }
+    cal_path = MODEL_DIR / f"{symbol}_calibrator.json"
+    with open(cal_path, 'w') as f:
+        json.dump(cal_data, f, indent=2)
+    status(f"✅ Calibrator saved → {cal_path.name}", symbol)
+
+
 # ─── Main Pipeline ─────────────────────────────────────────────────
 
 def retrain_symbol(symbol: str, force: bool = False) -> dict:
@@ -437,10 +521,16 @@ def retrain_symbol(symbol: str, force: bool = False) -> dict:
     
     if n_models < 5:
         status(f"❌ Too few models trained ({n_models}), restoring backup", symbol)
-        # Restore backup
         for f in backup_dir.iterdir():
             shutil.copy2(str(f), str(MODEL_DIR / f.name))
         return {'status': 'error', 'reason': f'too_few_models_{n_models}'}
+    
+    # 5b. Calibrate ensemble (fit Platt scaler on validation set)
+    status(f"Calibrating ensemble...", symbol)
+    try:
+        _calibrate_ensemble(symbol, feat_df)
+    except Exception as e:
+        status(f"⚠️ Calibration failed: {e}, continuing without calibrator", symbol)
     
     # 6. Validate — run quick backtest (skip if force=True)
     val_metrics = None

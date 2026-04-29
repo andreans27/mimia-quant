@@ -12,6 +12,7 @@ import time as ttime
 import warnings; warnings.filterwarnings('ignore')
 import numpy as np
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 
 from src.trading.signals import SignalGenerator
@@ -146,6 +147,20 @@ def run_backtest(symbol: str, test_hours: int = 24,
         except Exception:
             continue
     all_probas = np.where(n_valid > 0, all_probas / n_valid, 0.0)
+    
+    # Apply Platt scaling calibration (if available)
+    cal_path = Path("data/ml_models") / f"{symbol}_calibrator.json"
+    if cal_path.exists():
+        try:
+            import json
+            with open(cal_path) as f:
+                cal = json.load(f)
+            # Vectorized Platt scaling
+            z = cal['coef'] * all_probas + cal['intercept']
+            all_probas = np.clip(1.0 / (1.0 + np.exp(-z)), 0.0, 1.0)
+        except Exception:
+            pass  # No calibration available — use raw probas
+    
     all_signals = np.array([detect_signal(p) for p in all_probas])
 
     # ── 8. Trade simulation (deferred entry) ──

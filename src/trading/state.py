@@ -62,7 +62,7 @@ INITIAL_CAPITAL = 5000.0
 TAKER_FEE = 0.0004  # 0.04%
 SLIPPAGE = 0.0005   # 0.05%
 
-TF_GROUPS = ['full', 'm15', 'm30', 'h1', 'h4']
+TF_GROUPS = ['full']    # Only full ensemble — MI analysis showed 15m/30m/4h=zero signal
 SEEDS = [42, 101, 202, 303, 404]
 WARMUP_BARS = 200
 FETCH_DAYS = 130
