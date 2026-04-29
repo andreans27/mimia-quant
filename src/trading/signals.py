@@ -29,36 +29,36 @@ from src.strategies.ml_features import OHLCV_CACHE_DIR, OHLCV_FETCH_DAYS
 
 
 class SignalGenerator:
-    """Generates trading signals using the multi-TF XGBoost ensemble."""
+    """Generates trading signals using dual XGBoost ensembles (long + short)."""
 
-    def __init__(self, symbol: str):
+    def __init__(self, symbol: str, model_side: str = 'auto'):
         self.symbol = symbol
+        self.model_side = model_side  # 'long', 'short', or 'auto' (both)
         self._cache: Dict[str, Any] = {}  # symbol -> loaded data
-        self._calibrator: Optional[Dict] = None  # cached calibrator
+        self._calibrator: Dict[str, Optional[Dict]] = {}  # side -> calibrator (cached)
 
-    def _load_calibrator(self, symbol: str) -> Optional[Dict]:
-        """Load Platt scaling calibrator (cached)."""
-        if self._calibrator is not None:
-            return self._calibrator
-        cal_path = MODEL_DIR / f"{symbol}_calibrator.json"
+    def _load_calibrator(self, symbol: str, target_side: str = 'long') -> Optional[Dict]:
+        """Load Platt scaling calibrator for a specific model side (cached)."""
+        if target_side in self._calibrator:
+            return self._calibrator[target_side]
+        cal_path = MODEL_DIR / f"{symbol}_{target_side}_calibrator.json"
         if cal_path.exists():
             try:
                 with open(cal_path) as f:
-                    self._calibrator = json.load(f)
-                return self._calibrator
+                    cal = json.load(f)
+                self._calibrator[target_side] = cal
+                return cal
             except Exception:
                 return None
         return None
 
-    def _apply_calibration(self, raw_proba: float) -> float:
-        """Apply Platt scaling: calibrated = 1/(1+exp(-(coef*raw + intercept)))."""
-        cal = self._load_calibrator(self.symbol)
+    def _apply_calibration(self, raw_proba: float, target_side: str = 'long') -> float:
+        """Apply Platt scaling for a specific model side."""
+        cal = self._load_calibrator(self.symbol, target_side)
         if cal is None:
             return raw_proba
-        # Logistic function: 1 / (1 + exp(-z)) where z = coef * raw + intercept
         z = cal['coef'] * raw_proba + cal['intercept']
         calibrated = 1.0 / (1.0 + np.exp(-z))
-        # Clip to [0, 1]
         return float(np.clip(calibrated, 0.0, 1.0))
 
     def _fetch_5m_ohlcv(self, symbol: str, days: int = FETCH_DAYS) -> Optional[pd.DataFrame]:
@@ -232,11 +232,14 @@ class SignalGenerator:
         # First load: compute fresh features + load models
         group_models = {}
         for tf in TF_GROUPS:
+            # If model_side is specific ('long' or 'short'), only load that group
+            if self.model_side != 'auto' and tf != self.model_side:
+                continue
             models = self._load_tf_group(symbol, tf)
             if models:
                 group_models[tf] = models
 
-        if len(group_models) < 1:  # Need at least 1 TF group (was 2, now just 'full')
+        if len(group_models) < 1:
             return None
 
         fresh_features = self._compute_fresh_features(symbol)
@@ -294,32 +297,33 @@ class SignalGenerator:
             return None
 
     def _load_tf_group(self, symbol: str, tf_group: str) -> Optional[List]:
-        """Load models for one TF group."""
+        """Load models for one TF group. Supports 'full', 'long', 'short'."""
         models = []
-        if tf_group == 'full':
-            # Load meta.json if available (for reference, but feature names come from models)
+        if tf_group in ('full', 'long', 'short'):
+            # No prefixing for these groups
             meta = {}
-            meta_path = MODEL_DIR / f"{symbol}_ensemble_meta.json"
+            meta_path = MODEL_DIR / f"{symbol}_{tf_group}_meta.json"
             if meta_path.exists():
                 with open(meta_path) as f:
                     meta = json.load(f)
 
             for seed in SEEDS:
-                path = MODEL_DIR / f"{symbol}_xgb_ens_{seed}.json"
-                if not path.exists():
-                    path = MODEL_DIR / f"{symbol}_full_xgb_ens_{seed}.json"
+                path = MODEL_DIR / f"{symbol}_{tf_group}_xgb_ens_{seed}.json"
+                if tf_group == 'full':
+                    # Fallback: old naming without prefix
+                    if not path.exists():
+                        path = MODEL_DIR / f"{symbol}_xgb_ens_{seed}.json"
                 if not path.exists():
                     continue
                 m = xgb.XGBClassifier()
                 m.load_model(str(path))
                 # Extract feature names directly from the model
-                # (DO NOT rely on meta.json — it may not have features/model_features)
                 mf = m.get_booster().feature_names
                 if not mf:
-                    # Fallback: use meta if model has no feature_names (older models)
                     mf = meta.get('model_features', {}).get(str(seed), meta.get('features', []))
                 models.append((str(seed), m, mf))
         else:
+            # Legacy: TF-specific models with prefix (deprecated)
             prefix = f"{tf_group}_"
             for seed in SEEDS:
                 path = MODEL_DIR / f"{symbol}_{tf_group}_xgb_ens_{seed}.json"
@@ -340,12 +344,16 @@ class SignalGenerator:
     def generate_signal(self, symbol: str) -> Optional[Dict]:
         """Generate a signal for a symbol using the latest data.
 
+        Uses dual models: long ensemble (predicts UP > 0.5%) and short ensemble
+        (predicts DOWN > 0.5%). Takes the higher-confidence signal.
+
+        When model_side is 'long' or 'short' (calibration mode), computes only
+        that side's proba.
+
         Returns:
-            dict with keys: proba, signal (1=long, -1=short, 0=flat),
-            previous_proba, or None if error
+            dict with keys: proba (winning side), signal (1=long, -1=short, 0=flat),
+            long_proba, short_proba, or None if error
         """
-        # BUG FIX: Jangan strip 1000 prefix — Futures API menggunakan symbol ASLI!
-        # Cache file juga menggunakan nama symbol asli (1000PEPEUSDT_5m.parquet)
         try:
             cached = self._load_models(symbol)
             if cached is None:
@@ -354,67 +362,50 @@ class SignalGenerator:
             feat_df = cached['features']
             groups = cached['groups']
 
-            # Get latest feature row
-            latest_features = feat_df.iloc[-1:]
-            if len(latest_features) == 0:
+            if len(feat_df) == 0:
                 return None
 
-            # Compute probabilities from all groups
-            group_probs = []
-            for tf, models in groups.items():
+            def compute_side_proba(side: str) -> float:
+                """Compute ensemble proba for one side (long or short)."""
+                if side not in groups:
+                    return 0.5  # neutral if no models
+                tf_models = groups[side]
                 tf_probs = []
-                for seed, m, mf in models:
+                for seed, m, mf in tf_models:
                     available = [c for c in mf if c in feat_df.columns]
                     if len(available) < 5:
                         continue
                     X = feat_df[available].fillna(0).clip(-10, 10).values
-                    # Use last row
-                    X_row = X[-1:]
-                    probs = m.predict_proba(X_row)[:, 1]
+                    probs = m.predict_proba(X[-1:])[:, 1]
                     tf_probs.append(probs[0])
+                if not tf_probs:
+                    return 0.5
+                raw = float(np.mean(tf_probs))
+                return self._apply_calibration(raw, target_side=side)
 
-                if tf_probs:
-                    group_probs.append(np.mean(tf_probs))
+            # Compute both side probas
+            long_proba = compute_side_proba('long')
+            short_proba = compute_side_proba('short')
 
-            if len(group_probs) < 1:  # Only 1 TF group now ('full')
-                return None
-
-            proba = float(np.mean(group_probs))
-            # Apply Platt scaling calibration (spreads narrow raw probas to [0,1])
-            proba = self._apply_calibration(proba)
-
-            # Get previous bar proba for cross detection
-            prev_proba = None
-            if len(feat_df) >= 2:
-                prev_feat = feat_df.iloc[-2:-1]
-                prev_group_probs = []
-                for tf, models in groups.items():
-                    tf_probs = []
-                    for seed, m, mf in models:
-                        available = [c for c in mf if c in feat_df.columns]
-                        if len(available) < 5:
-                            continue
-                        X = feat_df[available].fillna(0).clip(-10, 10).values
-                        X_prev = X[-2:-1]
-                        if len(X_prev) > 0:
-                            probs = m.predict_proba(X_prev)[:, 1]
-                            tf_probs.append(probs[0])
-                    if tf_probs:
-                        prev_group_probs.append(np.mean(tf_probs))
-                if len(prev_group_probs) >= 1:
-                    prev_proba = float(np.mean(prev_group_probs))
-
-            # Determine signal: level-based (align with backtest)
-            signal = 0  # flat
-            if proba >= THRESHOLD:
-                signal = 1  # LONG
-            elif proba <= (1 - THRESHOLD):
-                signal = -1  # SHORT
+            # Main signal: pick the higher confidence
+            if long_proba >= THRESHOLD and long_proba >= short_proba:
+                # LONG signal — use long proba
+                proba = long_proba
+                signal = 1
+            elif short_proba >= THRESHOLD:
+                # SHORT signal — use short proba
+                proba = short_proba
+                signal = -1
+            else:
+                # No signal — use the higher of the two for monitoring
+                proba = max(long_proba, short_proba)
+                signal = 0
 
             return {
                 'proba': proba,
                 'signal': signal,
-                'prev_proba': prev_proba,
+                'long_proba': long_proba,
+                'short_proba': short_proba,
             }
 
         except Exception as e:

@@ -502,9 +502,12 @@ def compute_5m_features_5tf(
     # ── Combine ALL features ──
     combined = pd.concat([combined, xtf], axis=1)
     
-    # ── Target: aligned with deferred entry ──
+    # ── Target: dual — LONG predicts UP > 0.5%, SHORT predicts DOWN > 0.5% ──
     if not for_inference:
-        combined['target'] = (close_5m.shift(-(target_candle + 1)) > close_5m.shift(-1)).astype(float)
+        ret_10bar = close_5m.shift(-(target_candle + 1)) / close_5m.shift(-1) - 1
+        combined['target_long'] = (ret_10bar > 0.005).astype(float)
+        combined['target_short'] = (ret_10bar < -0.005).astype(float)
+        combined['target'] = combined['target_long']  # default/backward compat
     
     # ── Drop NaN rows ──
     if for_inference:
@@ -529,21 +532,19 @@ def prepare_ml_dataset(
     days: int = 120,
     cache_dir: str = "data/ml_cache",
     target_candle: int = 9,
-    intervals: Optional[List[str]] = None
+    intervals: Optional[List[str]] = None,
+    side: str = 'long'
 ) -> Tuple[pd.DataFrame, pd.Series, pd.DatetimeIndex]:
     """
-    Fetch 5m klines, compute features across 5 timeframes, return X, y.
+    Fetch 5m klines, compute features across timeframes, return X, y.
     
-    Architecture:
-      5m klines → resample to 15m/30m/1h/4h → compute features independently
-      on each TF → align all to 5m index → target = direction in 9 bars.
-      
     Args:
         symbol: Trading pair e.g. 'BTCUSDT'
         days: How many days of historical data to fetch
         cache_dir: Cache directory
-        target_candle: Number of 5m candles forward to predict (default 9 = 45min)
+        target_candle: Number of 5m candles forward to predict
         intervals: Timeframes to resample and compute features on
+        side: 'long' (UP > 0.5%) or 'short' (DOWN > 0.5%)
     
     Returns:
         (X, y, index) or (None, None, None) on failure
@@ -559,9 +560,12 @@ def prepare_ml_dataset(
     if cache_path.exists():
         print(f"  Loading cached features for {symbol} (5m base)...")
         df = pd.read_parquet(cache_path)
-        feature_cols = [c for c in df.columns if c != "target"]
-        print(f"    {len(df)} rows, {len(feature_cols)} features")
-        return df[feature_cols], df["target"], df.index
+        feature_cols = [c for c in df.columns if c not in ("target", "target_long", "target_short")]
+        target_col = f'target_{side}'
+        if target_col not in df.columns:
+            target_col = 'target'  # fallback for old caches
+        print(f"    {len(df)} rows, {len(feature_cols)} features, target='{target_col}'")
+        return df[feature_cols], df[target_col], df.index
 
     print(f"  Loading OHLCV data for {symbol} from shared cache...")
     df_5m = ensure_ohlcv_data(symbol, min_days=days)
@@ -573,13 +577,15 @@ def prepare_ml_dataset(
     print(f"    {symbol}: {len(df_5m)} bars of 5m data (shared cache)")
     print(f"  Computing features across {len(intervals)} timeframes for {symbol}...")
     combined = compute_5m_features_5tf(df_5m, target_candle=target_candle, intervals=intervals)
-    
+
     # Save to cache
     combined.to_parquet(cache_path)
     print(f"  Saved to {cache_path}")
-    
-    feature_cols = [c for c in combined.columns if c != "target"]
-    return combined[feature_cols], combined["target"], combined.index
+
+    exclude = {"target", "target_long", "target_short"}
+    feature_cols = [c for c in combined.columns if c not in exclude]
+    target_col = f'target_{side}'
+    return combined[feature_cols], combined[target_col], combined.index
 
 
 def _fetch_all_klines(client, symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:

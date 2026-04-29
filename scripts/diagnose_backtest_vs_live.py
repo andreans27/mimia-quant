@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from datetime import datetime, timedelta
 
 from src.trading.signals import SignalGenerator
@@ -27,6 +28,33 @@ from src.strategies.ml_features import compute_5m_features_5tf
 from src.trading.state import THRESHOLD
 
 WARMUP_BARS = 200  # must match backtest.py
+
+import json
+CALIBRATOR_CACHE = {}
+
+
+def _load_calibrator(symbol):
+    if symbol in CALIBRATOR_CACHE:
+        return CALIBRATOR_CACHE[symbol]
+    cal_path = Path("data/ml_models") / f"{symbol}_calibrator.json"
+    if cal_path.exists():
+        try:
+            with open(cal_path) as f:
+                cal = json.load(f)
+            CALIBRATOR_CACHE[symbol] = cal
+            return cal
+        except Exception:
+            return None
+    return None
+
+
+def _apply_calibration(probas, symbol):
+    """Vectorized Platt scaling calibration."""
+    cal = _load_calibrator(symbol)
+    if cal is None:
+        return probas
+    z = cal['coef'] * probas + cal['intercept']
+    return np.clip(1.0 / (1.0 + np.exp(-z)), 0.0, 1.0)
 
 
 def detect_signal(proba):
@@ -140,6 +168,8 @@ def compare_one_symbol(symbol, hours=24, verbose=True):
         except Exception:
             continue
     probas_bt = np.where(nv > 0, probas_bt / nv, 0.0)
+    # Apply calibration (same as backtest.py)
+    probas_bt = _apply_calibration(probas_bt, symbol)
     signals_bt = np.array([detect_signal(p) for p in probas_bt])
     
     # ── 8. Method B: TF-group mean per bar (live) ──
@@ -160,10 +190,12 @@ def compare_one_symbol(symbol, hours=24, verbose=True):
             if tf_probs:
                 group_probs.append(np.mean(tf_probs))
         
-        if len(group_probs) >= 2:
+        if len(group_probs) >= 1:
             probas_live[i] = np.mean(group_probs)
         else:
             probas_live[i] = probas_live[i-1] if i > 0 else probas_bt[i]
+    # Apply calibration (same as signals.py)
+    probas_live = _apply_calibration(probas_live, symbol)
     
     signals_live = np.array([detect_signal(p) for p in probas_live])
     

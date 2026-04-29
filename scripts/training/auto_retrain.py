@@ -51,7 +51,7 @@ STATUS_FILE = MODEL_DIR / "_retrain_status.json"
 SYMBOLS_10 = LIVE_SYMBOLS  # Use all 20 live trading symbols
 
 SEEDS = [42, 101, 202, 303, 404]
-TF_GROUPS = ['full']    # Only full ensemble — 15m/30m/4h had zero MI
+TF_GROUPS = ['long', 'short'] # Dual ensemble: long (predict UP) + short (predict DOWN)
 TFS = {'full': []}       # 'full' uses ALL available features
 
 DAYS_DATA = 130
@@ -115,9 +115,9 @@ def compute_features_5tf(ohlcv: pd.DataFrame, symbol: str) -> pd.DataFrame:
 def train_ensemble(symbol: str, feat_df: pd.DataFrame, target: pd.Series,
                    force: bool = False) -> dict:
     """
-    Train 5 seeds × 5 TF groups = 25 models.
-    Delegates to proper trainers: train_full_from_features + train_tf_from_features.
-    Returns metrics dict (same schema as old function for backward compatibility).
+    Train 5 seeds for each TF group (long/short).
+    Delegates to proper trainers: train_full_from_features.
+    Returns metrics dict.
     """
     n = len(feat_df)
     split = int(n * TRAIN_SPLIT)
@@ -127,18 +127,19 @@ def train_ensemble(symbol: str, feat_df: pd.DataFrame, target: pd.Series,
     successful = 0
 
     for tf in TF_GROUPS:
-        status(f"Training group '{tf}'...", symbol)
-
-        # Ensure target is in feat_df (it should be, but be safe)
-        if 'target' not in feat_df.columns:
-            status(f"  ❌ No target column in feat_df, skipping", symbol)
+        target_col = f'target_{tf}'  # 'target_long' or 'target_short'
+        if target_col not in feat_df.columns:
+            status(f"  ❌ No '{target_col}' column, skipping", symbol)
             continue
 
+        status(f"Training {tf.upper()} ensemble...", symbol)
+
+        # Remap target column for trainers (they expect 'target')
+        feat_copy = feat_df.copy()
+        feat_copy['target'] = feat_copy[target_col]
+
         try:
-            if tf == 'full':
-                meta = train_full_from_features(feat_df, symbol)
-            else:
-                meta = train_tf_from_features(feat_df, symbol, tf_prefix=tf, top_k=50)
+            meta = train_full_from_features(feat_copy, symbol, model_prefix=tf)
         except Exception as e:
             status(f"  ❌ {tf} failed: {e}", symbol)
             import traceback
@@ -170,37 +171,13 @@ def train_ensemble(symbol: str, feat_df: pd.DataFrame, target: pd.Series,
             avg_f1 = np.mean([m['test_f1'] for m in tf_metrics])
             status(f"  ✅ {len(tf_metrics)} seeds avg F1={avg_f1:.4f}", symbol)
 
-    # Save ensemble meta (overwrite with new version)
-    # Include features from the 'full' group models for downstream compatibility
-    # (These are used by _load_tf_group in signals.py to know which columns to extract)
-    full_features = {}
-    try:
-        for seed in SEEDS:
-            fp = MODEL_DIR / f"{symbol}_xgb_ens_{seed}.json"
-            if not fp.exists():
-                fp = MODEL_DIR / f"{symbol}_full_xgb_ens_{seed}.json"
-            if fp.exists():
-                m = xgb.XGBClassifier()
-                m.load_model(str(fp))
-                fn = m.get_booster().feature_names
-                if fn:
-                    full_features[str(seed)] = fn
-    except Exception:
-        pass
-
-    meta = {
+    # Save combined meta (aggregate of long + short)
+    combined_meta = {
         'symbol': symbol,
-        'model_params': {'uses_hparams_per_seed': True, 'hparams_source': 'train_tf_specific/train_ml_ensemble'},
-        'feature_subsample_ratio': 0.75,  # MI top_k + per-seed subsampling
-        'feature_count': -1,  # varies per TF group
-        'features': list(full_features.get(str(SEEDS[0]), [])),  # primary feature set
-        'model_features': full_features,  # per-seed features
-        'seeds': SEEDS,
         'tf_groups': TF_GROUPS,
         'n_models': successful,
         'n_expected': len(TF_GROUPS) * len(SEEDS),
         'train_split': TRAIN_SPLIT,
-        'improvement_threshold': IMPROVEMENT_THRESHOLD,
         'metrics_per_tf': {k: {'avg_f1': round(np.mean([m['test_f1'] for m in v]), 4),
                                 'best_f1': round(max(m['test_f1'] for m in v), 4),
                                 'n_seeds': len(v)}
@@ -208,9 +185,10 @@ def train_ensemble(symbol: str, feat_df: pd.DataFrame, target: pd.Series,
         'trained_at': datetime.now().isoformat(),
     }
     with open(MODEL_DIR / f'{symbol}_ensemble_meta.json', 'w') as f:
-        json.dump(meta, f, indent=2, default=str)
+        json.dump(combined_meta, f, indent=2, default=str)
 
-    return meta
+    return {'n_models': successful, 'n_expected': len(TF_GROUPS) * len(SEEDS),
+            'metrics': all_metrics}
 
 
 def validate_new_models(symbol: str, feat_df: pd.DataFrame = None) -> dict:
@@ -395,83 +373,94 @@ def backup_old_models(symbol: str):
 
 # ─── Calibration ────────────────────────────────────────────────
 
-def _calibrate_ensemble(symbol: str, feat_df: pd.DataFrame) -> None:
+def _calibrate_ensemble(symbol: str, feat_df: pd.DataFrame, target_side: str = 'long') -> None:
     """
-    Fit Platt scaling on validation set for the full ensemble.
-    
-    Steps:
-    1. Split feat_df 70/15/15 (same as training)
-    2. Load all 25 models
-    3. Get ensemble predictions on validation set
-    4. Fit logistic regression calibrator
-    5. Save calibrator to {symbol}_calibrator.json
-    
-    This calibrator is loaded during inference (signals.py, backtest.py)
-    to spread narrow proba range to [0, 1].
+    Fit Platt scaling on validation set for one model side.
+    Loads models DIRECTLY from files (not via SignalGenerator) to ensure
+    feature columns match the training data.
+
+    Args:
+        symbol: Trading symbol
+        feat_df: Feature DataFrame (from training, with full columns)
+        target_side: 'long' or 'short' — which model set to calibrate
     """
-    from src.trading.signals import SignalGenerator
     from sklearn.linear_model import LogisticRegression
     import json
     from pathlib import Path
-    
+
+    try:
+        import xgboost as xgb
+    except ImportError:
+        pass
+
     # 1. Split data
     n = len(feat_df)
     train_size = int(n * 0.7)
     val_size = int(n * 0.15)
-    
-    X_all = feat_df.drop(columns=['target'])
-    y_all = feat_df['target']
-    
+
+    target_col = f'target_{target_side}'
+    if target_col not in feat_df.columns:
+        raise ValueError(f"Column '{target_col}' not in feat_df for calibration")
+
+    # Drop all target columns for X
+    X_all = feat_df.drop(columns=[c for c in ['target', 'target_long', 'target_short'] if c in feat_df.columns])
+    y_all = feat_df[target_col]
+
     X_val = X_all.iloc[train_size:train_size + val_size]
     y_val = y_all.iloc[train_size:train_size + val_size]
-    
-    # 2. Load models and get ensemble predictions on validation set
-    gen = SignalGenerator(symbol)
-    cached = gen._load_models(symbol)
-    if cached is None:
-        raise ValueError(f"No models loaded for {symbol}")
-    
-    groups = cached['groups']
-    
-    # Get all model predictions on validation set
+
+    # 2. Load models DIRECTLY from disk (no SignalGenerator — avoids feature mismatch)
+    loaded = []
+    for seed in SEEDS:
+        path = MODEL_DIR / f"{symbol}_{target_side}_xgb_ens_{seed}.json"
+        if not path.exists():
+            continue
+        m = xgb.XGBClassifier()
+        m.load_model(str(path))
+        mf = m.get_booster().feature_names
+        if mf:
+            loaded.append((m, mf))
+
+    if len(loaded) < 3:
+        raise ValueError(f"Only {len(loaded)} {target_side} models loaded (need ≥3)")
+
+    # 3. Ensemble predictions on validation set
     all_preds = []
-    for tg, models in groups.items():
-        for seed, m, mf in models:
-            available = [c for c in mf if c in X_val.columns]
-            if len(available) < 5:
-                continue
-            X_sub = X_val[available].fillna(0).clip(-10, 10).values
-            probs = m.predict_proba(X_sub)[:, 1]
-            all_preds.append(probs)
-    
-    if len(all_preds) < 3:  # Need at least 3 models (was 10, now only 5 total)
-        raise ValueError(f"Only {len(all_preds)} models available (need ≥10)")
-    
-    # 3. Ensemble average = raw proba
+    for m, mf in loaded:
+        available = [c for c in mf if c in X_val.columns]
+        if len(available) < 5:
+            continue
+        X_sub = X_val[available].fillna(0).clip(-10, 10).values
+        probs = m.predict_proba(X_sub)[:, 1]
+        all_preds.append(probs)
+
+    if len(all_preds) < 3:
+        raise ValueError(f"Only {len(all_preds)} {target_side} models with valid features")
+
     raw_probas = np.mean(all_preds, axis=0)
-    
+
     # 4. Fit Platt calibrator
     calibrator = LogisticRegression(C=1e10, solver='lbfgs')
     calibrator.fit(raw_probas.reshape(-1, 1), y_val.values)
-    
-    # Evaluate
+
     cal_probas = calibrator.predict_proba(raw_probas.reshape(-1, 1))[:, 1]
     raw_auc = __import__('sklearn').metrics.roc_auc_score(y_val, raw_probas)
     cal_auc = __import__('sklearn').metrics.roc_auc_score(y_val, cal_probas)
-    status(f"Calibration: raw AUC={raw_auc:.4f} → cal AUC={cal_auc:.4f}, "
+    status(f"Calibration ({target_side}): raw AUC={raw_auc:.4f} → cal AUC={cal_auc:.4f}, "
            f"raw range=[{raw_probas.min():.4f},{raw_probas.max():.4f}] "
            f"→ cal range=[{cal_probas.min():.4f},{cal_probas.max():.4f}]", symbol)
-    
-    # 5. Save
+
+    # 5. Save with side prefix
     cal_data = {
         'type': 'platt',
+        'side': target_side,
         'coef': float(calibrator.coef_[0][0]),
         'intercept': float(calibrator.intercept_[0]),
         'raw_range': [float(raw_probas.min()), float(raw_probas.max())],
         'cal_range': [float(cal_probas.min()), float(cal_probas.max())],
         'val_size': len(y_val),
     }
-    cal_path = MODEL_DIR / f"{symbol}_calibrator.json"
+    cal_path = MODEL_DIR / f"{symbol}_{target_side}_calibrator.json"
     with open(cal_path, 'w') as f:
         json.dump(cal_data, f, indent=2)
     status(f"✅ Calibrator saved → {cal_path.name}", symbol)
@@ -500,14 +489,14 @@ def retrain_symbol(symbol: str, force: bool = False) -> dict:
         return {'status': 'error', 'reason': 'feature_failure'}
     status(f"✅ {len(feat_df)} rows × {len(feat_df.columns)} cols", symbol)
     
-    # 3. Use existing target from pre-computed features (same as voting pipeline)
-    # The ml_features target is: (close.shift(-9) > close) — 45 min forward, any positive move
-    if 'target' not in feat_df.columns:
-        status(f"❌ No 'target' column in features, cannot train", symbol)
-        return {'status': 'error', 'reason': 'missing_target'}
-    target = feat_df['target']
-    pos_ratio = target.mean()
-    status(f"Target: {pos_ratio*100:.1f}% positive (from features)", symbol)
+    # 3. Use dual targets (target_long + target_short)
+    if 'target_long' not in feat_df.columns or 'target_short' not in feat_df.columns:
+        status(f"❌ Missing 'target_long' or 'target_short' columns", symbol)
+        return {'status': 'error', 'reason': 'missing_dual_targets'}
+    target = feat_df['target_long']  # default for backward compat
+    long_ratio = feat_df['target_long'].mean()
+    short_ratio = feat_df['target_short'].mean()
+    status(f"Targets: LONG={long_ratio*100:.1f}% | SHORT={short_ratio*100:.1f}% positive", symbol)
     
     # 4. Backup old models before training (in case training fails)
     backup_dir = backup_old_models(symbol)
@@ -519,18 +508,20 @@ def retrain_symbol(symbol: str, force: bool = False) -> dict:
     n_models = train_meta.get('n_models', 0)
     status(f"✅ {n_models} models trained", symbol)
     
+    # Expect 10 models (5 long + 5 short), but accept min 5 (one side)
     if n_models < 5:
         status(f"❌ Too few models trained ({n_models}), restoring backup", symbol)
         for f in backup_dir.iterdir():
             shutil.copy2(str(f), str(MODEL_DIR / f.name))
         return {'status': 'error', 'reason': f'too_few_models_{n_models}'}
     
-    # 5b. Calibrate ensemble (fit Platt scaler on validation set)
-    status(f"Calibrating ensemble...", symbol)
-    try:
-        _calibrate_ensemble(symbol, feat_df)
-    except Exception as e:
-        status(f"⚠️ Calibration failed: {e}, continuing without calibrator", symbol)
+    # 5b. Calibrate both ensembles
+    for side in ['long', 'short']:
+        try:
+            status(f"Calibrating {side} ensemble...", symbol)
+            _calibrate_ensemble(symbol, feat_df, target_side=side)
+        except Exception as e:
+            status(f"⚠️ {side} calibration failed: {e}", symbol)
     
     # 6. Validate — run quick backtest (skip if force=True)
     val_metrics = None

@@ -25,18 +25,6 @@ from src.trading.state import (
 WARMUP_BARS = 200
 
 
-# ─── Helpers ────────────────────────────────────────────────
-
-def detect_signal(proba: float) -> int:
-    if proba is None:
-        return 0
-    if proba >= THRESHOLD:
-        return 1  # LONG
-    if proba <= (1 - THRESHOLD):
-        return -1  # SHORT
-    return 0  # FLAT
-
-
 # ─── Core Backtest ──────────────────────────────────────────
 
 WalkForwardResult = Dict[str, object]
@@ -87,7 +75,7 @@ def run_backtest(symbol: str, test_hours: int = 24,
     # Align close prices to feat_df's index (feat_df index is subset of df_5m index)
     close_arr = df_5m.loc[feat_df.index, 'close'].astype(float).values
 
-    # ── 4. Build model refs + feature mapping ──
+    # ── 4. Build model refs + feature mapping (separate for long/short) ──
     all_model_feats = sorted(set(
         f for _, models in model_groups.items()
         for _, m, mf in models for f in mf
@@ -98,19 +86,25 @@ def run_backtest(symbol: str, test_hours: int = 24,
     # Map model features to positions in feat_df columns
     feat_cols = list(feat_df.columns)
     feat_to_col = {f: i for i, f in enumerate(feat_cols)}
-    
+
     # Warn about missing features
     missing_feats = [f for f in all_model_feats if f not in feat_to_col]
     if missing_feats:
         log_func(f"⚠️ {len(missing_feats)} model features not in feat_df (will be 0.0)")
 
-    # Pre-compile model refs with mf_to_idx (feat_matrix column indices)
-    model_refs = []
+    # Pre-compile model refs with separate long/short groups
+    long_refs = []
+    short_refs = []
     for tg, models in model_groups.items():
         for seed, m, mf in models:
             avail = [mf_to_idx[f] for f in mf if f in mf_to_idx]
             if len(avail) >= 5:
-                model_refs.append((m, np.array(avail, dtype=np.int32)))
+                arr = np.array(avail, dtype=np.int32)
+                ref = (m, arr)
+                if tg == 'long':
+                    long_refs.append(ref)
+                elif tg == 'short':
+                    short_refs.append(ref)
 
     # ── 5. Test range (in feat_df index) ──
     now = datetime.utcnow().replace(second=0, microsecond=0)
@@ -136,32 +130,56 @@ def run_backtest(symbol: str, test_hours: int = 24,
                 np.nan_to_num(feat_slice[:, col_pos], nan=0.0), -10, 10
             )
 
-    # ── 7. Batch model inference ──
-    all_probas = np.zeros(n_test, dtype=np.float64)
-    n_valid = np.zeros(n_test, dtype=np.int32)
-    for model, feat_idx in model_refs:
-        try:
-            preds = model.predict_proba(feat_matrix[:, feat_idx])[:, 1]
-            all_probas += preds
-            n_valid += 1
-        except Exception:
-            continue
-    all_probas = np.where(n_valid > 0, all_probas / n_valid, 0.0)
+    # ── 7. Batch model inference (dual: long + short) ──
+    def _batch_infer(refs, feat_matrix):
+        """Compute ensemble probas for a list of model refs."""
+        probas = np.zeros(n_test, dtype=np.float64)
+        nv = np.zeros(n_test, dtype=np.int32)
+        for model, feat_idx in refs:
+            try:
+                preds = model.predict_proba(feat_matrix[:, feat_idx])[:, 1]
+                probas += preds
+                nv += 1
+            except Exception:
+                continue
+        return np.where(nv > 0, probas / nv, 0.0)
+
+    def _apply_cal(probas, symbol, side):
+        """Apply Platt scaling calibration for one side."""
+        cal_path = Path("data/ml_models") / f"{symbol}_{side}_calibrator.json"
+        if cal_path.exists():
+            try:
+                import json
+                with open(cal_path) as f:
+                    cal = json.load(f)
+                z = cal['coef'] * probas + cal['intercept']
+                return np.clip(1.0 / (1.0 + np.exp(-z)), 0.0, 1.0)
+            except Exception:
+                pass
+        return probas
+
+    long_probas = _batch_infer(long_refs, feat_matrix)
+    long_probas = _apply_cal(long_probas, symbol, 'long')
     
-    # Apply Platt scaling calibration (if available)
-    cal_path = Path("data/ml_models") / f"{symbol}_calibrator.json"
-    if cal_path.exists():
-        try:
-            import json
-            with open(cal_path) as f:
-                cal = json.load(f)
-            # Vectorized Platt scaling
-            z = cal['coef'] * all_probas + cal['intercept']
-            all_probas = np.clip(1.0 / (1.0 + np.exp(-z)), 0.0, 1.0)
-        except Exception:
-            pass  # No calibration available — use raw probas
-    
-    all_signals = np.array([detect_signal(p) for p in all_probas])
+    short_probas = _batch_infer(short_refs, feat_matrix)
+    short_probas = _apply_cal(short_probas, symbol, 'short')
+
+    # Combined signal: LONG if long confident, SHORT if short confident
+    all_signals = np.zeros(n_test, dtype=np.int32)
+    long_mask = long_probas >= THRESHOLD
+    short_mask = short_probas >= THRESHOLD
+    # If both signals active, pick higher confidence
+    both = long_mask & short_mask
+    pick_long = long_probas >= short_probas  # tie → long
+    all_signals[both & pick_long] = 1
+    all_signals[both & ~pick_long] = -1
+    all_signals[long_mask & ~short_mask] = 1
+    all_signals[short_mask & ~long_mask] = -1
+
+    # Store both probas for diagnostics
+    all_probas = np.where(all_signals == 1, long_probas,
+                          np.where(all_signals == -1, short_probas,
+                                   np.maximum(long_probas, short_probas)))
 
     # ── 8. Trade simulation (deferred entry) ──
     capital = INITIAL_CAPITAL
@@ -234,6 +252,8 @@ def run_backtest(symbol: str, test_hours: int = 24,
         'long_pnl': lp, 'short_pnl': sp_,
         'max_dd': mdd, 'elapsed': elapsed,
         'probas': all_probas.tolist(),
+        'long_probas': long_probas.tolist(),
+        'short_probas': short_probas.tolist(),
         'signals': all_signals.tolist(),
         'timestamps': [feat_df.index[bi] for bi in test_range],
         'trade_details': trade_details,

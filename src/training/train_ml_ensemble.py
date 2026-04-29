@@ -71,12 +71,21 @@ def select_features(X_train, y_train, X_val=None):
     return X_train, X_val, top_features
 
 
-def train_full_from_features(feat_df: pd.DataFrame, symbol: str) -> dict:
+def train_full_from_features(feat_df: pd.DataFrame, symbol: str, model_prefix: str = 'full') -> dict:
     """
     Train 'full' ensemble using pre-computed features (ALL features from all TFs).
-    Saves as {symbol}_full_xgb_ens_{seed}.json — compatible with load_models() fallback.
+    Saves as {symbol}_{model_prefix}_xgb_ens_{seed}.json.
 
-    This is the core training function used by auto_retrain.py for the 'full' TF group.
+    With dual model support, call twice:
+      train_full_from_features(feat_df, symbol, model_prefix='long')
+      train_full_from_features(feat_df, symbol, model_prefix='short')
+
+    Args:
+        feat_df: DataFrame with features + target column
+        symbol: Trading symbol
+        model_prefix: 'full'|'long'|'short' — used in model file naming
+
+    This is the core training function used by auto_retrain.py for all TF groups.
     """
     print(f"\n{'='*60}")
     print(f"Training FULL ensemble for {symbol} (5 models, all features)...")
@@ -87,7 +96,7 @@ def train_full_from_features(feat_df: pd.DataFrame, symbol: str) -> dict:
         return None
 
     # Use all feature columns (exclude target and non-feature columns)
-    exclude_cols = {'target', 'timestamp', 'open', 'high', 'low', 'close', 'volume'}
+    exclude_cols = {'target', 'target_long', 'target_short', 'timestamp', 'open', 'high', 'low', 'close', 'volume'}
     feature_names = [c for c in feat_df.columns if c not in exclude_cols]
 
     X = feat_df[feature_names]
@@ -206,14 +215,14 @@ def train_full_from_features(feat_df: pd.DataFrame, symbol: str) -> dict:
 
     print(f"    Best threshold: {best_thresh:.2f} (F1={best_f1:.3f})")
 
-    # Save models with 'full' prefix (compatible with load_models)
+    # Save models with model_prefix (e.g., 'full', 'long', 'short')
     model_paths = {}
     for seed, model, mf in models:
-        path = MODEL_DIR / f"{symbol}_full_xgb_ens_{seed}.json"
+        path = MODEL_DIR / f"{symbol}_{model_prefix}_xgb_ens_{seed}.json"
         model.save_model(str(path))
         model_paths[str(seed)] = str(path)
 
-    # Save meta with same name as original (load_models looks for this)
+    # Save meta with model_prefix
     meta = {
         'symbol': symbol,
         'ensemble_size': len(SEEDS),
@@ -231,11 +240,11 @@ def train_full_from_features(feat_df: pd.DataFrame, symbol: str) -> dict:
         'training_date': datetime.now().isoformat(),
     }
 
-    meta_path = MODEL_DIR / f"{symbol}_ensemble_meta.json"
+    meta_path = MODEL_DIR / f"{symbol}_{model_prefix}_meta.json"
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2, default=lambda x: float(x) if isinstance(x, (np.floating, np.integer)) else str(x))
 
-    print(f"\n  ✅ FULL ensemble saved: {len(SEEDS)} models + metadata")
+    print(f"\\n  ✅ {model_prefix.upper()} ensemble saved: {len(SEEDS)} models + metadata")
     print(f"    Best thr={best_thresh:.2f}, AUC={meta['ensemble_metrics']['test_auc']:.3f}")
     return meta
 
