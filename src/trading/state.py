@@ -54,7 +54,7 @@ LIVE_SYMBOLS = [
 # Trading parameters (from optimal parameter sweep v4 — Apr 29)
 THRESHOLD = 0.50      # Optimal: lower = more trades, still 91% WR
 HOLD_BARS = 10         # Optimal: 10 bars (50 min) gives highest PnL
-COOLDOWN_BARS = 3      # Wait 15 min between trades
+COOLDOWN_BARS = 2      # Optimal: 2 bars (10 min) — from sweep 0-5, cd=2 wins
 POSITION_PCT = 0.15    # Risk 15% of capital per trade (baseline)
 MARGIN_PCT = 0.01      # 1% of total balance per position
 LEVERAGE_X = 10        # 10x leverage

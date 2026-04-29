@@ -1183,7 +1183,7 @@ class LiveTrader:
         state['entry_price'] = entry_price
         state['entry_time'] = int(time.time() * 1000)
         state['entry_proba'] = proba
-        state['hold_remaining'] = HOLD_BARS
+        state['hold_remaining'] = get_symbol_hold_bars(symbol)
         state['cooldown_remaining'] = 0
         state['qty'] = final_qty
 
