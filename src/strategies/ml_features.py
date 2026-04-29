@@ -16,12 +16,69 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from pathlib import Path
+import os
+import time
 import json
 from datetime import datetime, timedelta
 
 # ── Shared OHLCV Cache (single source of truth for ALL processes) ──────
 OHLCV_CACHE_DIR = Path("data/ohlcv_cache")
 OHLCV_FETCH_DAYS = 120  # Days of 5m data to fetch on first run
+
+# ── File-based write lock to prevent race conditions ──
+# Multiple daemon instances can write to the same parquet file simultaneously,
+# causing corruption. Lock files are per-symbol and auto-expire after 30s.
+CACHE_LOCK_TIMEOUT = 30  # seconds
+
+
+def _acquire_cache_lock(symbol: str) -> bool:
+    """Try to acquire exclusive write lock for a symbol's cache file.
+    Returns True if lock acquired, False if already locked by another process.
+    Locks auto-expire after CACHE_LOCK_TIMEOUT seconds (stale lock recovery)."""
+    lock_path = OHLCV_CACHE_DIR / f".{symbol}_5m.lock"
+    OHLCV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        # Try exclusive creation — fails if file exists
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        # Check if lock is stale
+        try:
+            age = time.time() - lock_path.stat().st_mtime
+            if age > CACHE_LOCK_TIMEOUT:
+                lock_path.unlink(missing_ok=True)
+                # Retry once
+                try:
+                    fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    os.write(fd, str(os.getpid()).encode())
+                    os.close(fd)
+                    print(f"    ⚠️ Stale lock recovered for {symbol}")
+                    return True
+                except FileExistsError:
+                    return False
+            return False
+        except FileNotFoundError:
+            return False
+    except Exception:
+        return False
+
+
+def _release_cache_lock(symbol: str):
+    """Release write lock for a symbol's cache file."""
+    lock_path = OHLCV_CACHE_DIR / f".{symbol}_5m.lock"
+    try:
+        # Only delete if this process owns the lock
+        if lock_path.exists():
+            try:
+                pid = int(lock_path.read_text().strip())
+                if pid == os.getpid():
+                    lock_path.unlink(missing_ok=True)
+            except (ValueError, IOError):
+                lock_path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def ensure_ohlcv_data(symbol: str, min_days: int = 120) -> Optional[pd.DataFrame]:
@@ -50,11 +107,20 @@ def ensure_ohlcv_data(symbol: str, min_days: int = 120) -> Optional[pd.DataFrame
     # NOT from testnet — critical for data consistency across all processes
     df = _fetch_5m_public_klines(symbol, days=min_days)
 
-    # Save to shared cache
+    # Save to shared cache (with write lock to prevent race conditions)
     if df is not None and len(df) >= 1000:
         OHLCV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(cache_path)
-        print(f"  💾 Cached {len(df)} OHLCV bars → {cache_path}")
+        locked = _acquire_cache_lock(symbol)
+        if locked:
+            try:
+                df.to_parquet(cache_path)
+                print(f"  💾 Cached {len(df)} OHLCV bars → {cache_path}")
+            finally:
+                _release_cache_lock(symbol)
+        else:
+            # Lock held by another process — skip write entirely
+            # Return fetched data without caching (other process will cache it)
+            print(f"  ⏭ Cache write skipped for {symbol} (locked by another process)")
 
     return df
 

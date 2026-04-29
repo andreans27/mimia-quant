@@ -94,11 +94,19 @@ class SignalGenerator:
         return None
 
     def _save_ohlcv_cache(self, symbol: str, df: pd.DataFrame):
-        """Save OHLCV data to local cache."""
+        """Save OHLCV data to local cache (with write lock)."""
+        from src.strategies.ml_features import _acquire_cache_lock, _release_cache_lock
         OHLCV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         cache_path = OHLCV_CACHE_DIR / f"{symbol}_5m.parquet"
-        df.to_parquet(cache_path)
-        print(f"    💾 Cached {len(df)} bars → {cache_path}")
+        locked = _acquire_cache_lock(symbol)
+        if locked:
+            try:
+                df.to_parquet(cache_path)
+                print(f"    💾 Cached {len(df)} bars → {cache_path}")
+            finally:
+                _release_cache_lock(symbol)
+        else:
+            print(f"    ⏭ Cache write skipped for {symbol} (locked by another process)")
 
     def _fetch_ohlcv_range(self, symbol: str, start_ms: int) -> Optional[pd.DataFrame]:
         """Fetch 5m OHLCV from start_ms to now (incremental)."""

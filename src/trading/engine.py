@@ -557,12 +557,15 @@ class LiveTrader:
 
     def _build_report(self, capital: float, peak_capital: float, dd: float,
                       opened: int, closed: int, trade_lines: List[str]) -> str:
-        """Build Telegram report message."""
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
-        pnl = capital - INITIAL_CAPITAL
-        pnl_pct = pnl / INITIAL_CAPITAL * 100
+        """Build Telegram report message.
 
-        # Get realized PnL from closed trades
+        Portfolio metrics calculated from DB trade history, NOT Binance wallet.
+        Capital = INITIAL_CAPITAL + realized PnL from closed trades.
+        Unrealized PnL estimated from open positions (entry price vs current mark).
+        """
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
+
+        # Get realized PnL from closed trades (DB source of truth)
         c = self.conn.cursor()
         c.execute("""
             SELECT COUNT(*), COALESCE(SUM(CASE WHEN pnl_net > 0 THEN 1 ELSE 0 END), 0),
@@ -576,9 +579,12 @@ class LiveTrader:
         win_rate = wins / total_trades * 100 if total_trades > 0 else 0
         pf = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
-        # Calculate unrealized PnL from open positions
-        wallet_balance = INITIAL_CAPITAL + realized_pnl
-        unrealized_pnl = capital - wallet_balance
+        # Calculate capital from DB trade history only (NOT Binance wallet)
+        db_capital = INITIAL_CAPITAL + realized_pnl
+        db_peak_capital = max(peak_capital, db_capital)
+        db_dd = (db_peak_capital - db_capital) / db_peak_capital * 100 if db_peak_capital > 0 else 0
+        pnl = realized_pnl
+        pnl_pct = pnl / INITIAL_CAPITAL * 100
 
         # Get open positions with direction + unrealized PnL from Binance
         running_positions = []
@@ -629,16 +635,14 @@ class LiveTrader:
             f"📊 *Mimia Live Trade Report*\n"
             f"`{now}`\n\n"
             f"*Portfolio*\n"
-            f"  Equity: `${capital:.2f}` | Peak: `${peak_capital:.2f}`\n"
-            f"  PnL: `${pnl:+.2f}` ({pnl_pct:+.2f}%) | DD: `{dd:.2f}%`\n"
+            f"  Equity: `${db_capital:.2f}` | Peak: `${db_peak_capital:.2f}`\n"
+            f"  PnL: `${pnl:+.2f}` ({pnl_pct:+.2f}%) | DD: `{db_dd:.2f}%`\n"
         )
 
-        # Add realized/unrealized breakdown
-        if unrealized_pnl != 0 or realized_pnl != 0:
-            # Always show realized; only show unrealized when non-trivial
+        # Realized PnL only (from DB — no wallet/balance dependency)
+        if realized_pnl != 0 or total_trades > 0:
             msg += (
-                f"  ├ Realized: `${realized_pnl:+.2f}` (closed trades)\n"
-                f"  └ Unrealized: `${unrealized_pnl:+.2f}` (open positions)\n"
+                f"  Realized PnL: `${realized_pnl:+.2f}` ({total_trades} trades)\n"
             )
 
         msg += (
