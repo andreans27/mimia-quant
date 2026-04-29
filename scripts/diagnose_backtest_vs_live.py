@@ -86,13 +86,13 @@ def compare_one_symbol(symbol, hours=24, verbose=True):
     if missing:
         log(f"⚠️ {len(missing)} model features missing (will be 0.0)")
     
-    # Pre-compile model refs (feat_df column indices)
+    # Pre-compile model refs (feat_matrix column indices via mf_to_idx)
     model_refs = []
-    tf_model_refs = {}  # {tf_group: [(model, feat_col_indices)]}
+    tf_model_refs = {}  # {tf_group: [(model, feat_matrix_col_indices)]}
     for tg, models in groups.items():
         tf_list = []
         for seed, m, mf in models:
-            avail = [feat_to_col[f] for f in mf if f in feat_to_col]
+            avail = [mf_to_idx[f] for f in mf if f in mf_to_idx]
             if len(avail) >= 5:
                 arr = np.array(avail, dtype=np.int32)
                 model_refs.append((m, arr))
