@@ -4,6 +4,9 @@ __pycache__/
 *$py.class
 *.so
 
+# Project-specific data (models, cache, DB, logs)
+data/
+
 # C extensions
 *.c
 *.o
