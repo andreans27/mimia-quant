@@ -51,63 +51,43 @@ LIVE_SYMBOLS = [
     "WLDUSDT",     # WR=84.2% PF=17.02 DD=0.39%
 ]
 
-# Trading parameters (from optimal backtest sweep)
-THRESHOLD = 0.60
-HOLD_BARS = 9       # Hold position for ~45 min (9 x 5m)
-COOLDOWN_BARS = 3   # Wait 15 min between trades
-POSITION_PCT = 0.15 # Risk 15% of capital per trade (deprecated — use MARGIN_PCT * LEVERAGE)
-MARGIN_PCT = 0.01   # 1% of total balance per position
-LEVERAGE_X = 10     # 10x leverage
+# Trading parameters (from optimal parameter sweep v4 — Apr 29)
+THRESHOLD = 0.50      # Optimal: lower = more trades, still 91% WR
+HOLD_BARS = 10         # Optimal: 10 bars (50 min) gives highest PnL
+COOLDOWN_BARS = 3      # Wait 15 min between trades
+POSITION_PCT = 0.15    # Risk 15% of capital per trade (baseline)
+MARGIN_PCT = 0.01      # 1% of total balance per position
+LEVERAGE_X = 10        # 10x leverage
 
 # ─── Enhanced Parameters ───────────────────────────────────────────
 
 # Per-symbol thresholds: lower for low-freq symbols to increase trade count
-# Default THRESHOLD (0.60) used for symbols not listed here
-SYMBOL_THRESHOLDS = {
-    'BNBUSDT': 0.55,
-    'SOLUSDT': 0.55,
-    'ADAUSDT': 0.55,
-    'LINKUSDT': 0.55,
-    'ETHUSDT': 0.55,
-    'AVAXUSDT': 0.55,
-}
+# Optimal from sweep v4: global THRESHOLD=0.50 is optimal for ALL symbols
+# Per-symbol adjustments not needed — empty dict, all use THRESHOLD
+SYMBOL_THRESHOLDS = {}
 
 # Per-symbol hold bars based on volatility regime
-# HIGH volatility → shorter hold (less exposure risk)
-# LOW volatility → longer hold (allow more time for TP)
-# Default HOLD_BARS (9) used for symbols not listed here
+# Optimal from sweep v4: high-vol = 9 (vs global 10), produces marginal +$23 improvement
+# Default HOLD_BARS (10) for all others
 HOLD_BARS_PER_SYMBOL = {
-    'WIFUSDT': 8,
-    'DOGEUSDT': 8,
-    '1000PEPEUSDT': 8,
-    'INJUSDT': 8,
-    'ENAUSDT': 8,
-    'ARBUSDT': 8,
-    'SEIUSDT': 8,
-    'TIAUSDT': 8,
-    'BNBUSDT': 12,
-    'ETHUSDT': 12,
-    'LINKUSDT': 12,
-    'SOLUSDT': 12,
-    'ADAUSDT': 11,
-    'AVAXUSDT': 10,
-    'NEARUSDT': 10,
+    'WIFUSDT': 9,
+    'DOGEUSDT': 9,
+    '1000PEPEUSDT': 9,
+    'INJUSDT': 9,
 }
 
 # Dynamic position sizing: proba → position_pct fraction of capital
-# Strategy: only INCREASE position size for high confidence (> 15% baseline).
-# Never decrease — baseline 15% is already validated as optimal.
-#   proba 0.60 → 0.15  (same as baseline)
-#   proba 0.65 → 0.15  (same as baseline)
-#   proba 0.70 → 0.15  (same as baseline)
-#   proba 0.75 → 0.20  (higher confidence → larger position)
-#   proba 0.80 → 0.25  (very high confidence → max)
+# Optimal from param sweep v4 (aggressive variant = best +44.5% over fixed 15%):
+#   proba 0.50-0.64 → 0.15  (same as baseline — baseline 15% is already optimal)
+#   proba 0.65-0.69 → 0.18  (moderate confidence → slight increase)
+#   proba 0.70-0.74 → 0.22  (high confidence → larger position)
+#   proba 0.75-0.79 → 0.28  (very high confidence → much larger)
+#   proba ≥ 0.80    → 0.35  (extremely high confidence → max deployment)
 SIZE_BY_PROBA = {
-    0.60: 0.15,
-    0.65: 0.15,
-    0.70: 0.15,
-    0.75: 0.20,
-    0.80: 0.25,
+    0.65: 0.18,
+    0.70: 0.22,
+    0.75: 0.28,
+    0.80: 0.35,
 }
 
 def get_symbol_threshold(symbol: str) -> float:
