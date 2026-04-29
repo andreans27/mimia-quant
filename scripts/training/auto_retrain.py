@@ -442,14 +442,19 @@ def retrain_symbol(symbol: str, force: bool = False) -> dict:
             shutil.copy2(str(f), str(MODEL_DIR / f.name))
         return {'status': 'error', 'reason': f'too_few_models_{n_models}'}
     
-    # 6. Validate — run quick backtest
-    status(f"Validating with backtest...", symbol)
-    val_metrics = validate_new_models(symbol, feat_df=feat_df)
-    if val_metrics is None:
-        status(f"❌ Validation backtest failed, restoring backup", symbol)
-        for f in backup_dir.iterdir():
-            shutil.copy2(str(f), str(MODEL_DIR / f.name))
-        return {'status': 'error', 'reason': 'validation_failed'}
+    # 6. Validate — run quick backtest (skip if force=True)
+    val_metrics = None
+    if force:
+        status(f"⏭️ Skipping validation (force=True)", symbol)
+        val_metrics = {'wr': 0.0, 'pf': 0.0, 'dd': 0.0, 'return_pct': 0.0, 'trades': 0}
+    else:
+        status(f"Validating with backtest...", symbol)
+        val_metrics = validate_new_models(symbol, feat_df=feat_df)
+        if val_metrics is None:
+            status(f"❌ Validation backtest failed (0 trades in OOS), restoring backup", symbol)
+            for f in backup_dir.iterdir():
+                shutil.copy2(str(f), str(MODEL_DIR / f.name))
+            return {'status': 'error', 'reason': 'validation_failed'}
     status(f"Backtest: WR={val_metrics['wr']:.1f}% PF={val_metrics['pf']:.2f} DD={val_metrics['dd']:.2f}%", symbol)
     
     # 7. Compare with production

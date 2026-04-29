@@ -545,9 +545,12 @@ def compute_5m_features_5tf(
     # ── Combine ALL features ──
     combined = pd.concat([combined, xtf], axis=1)
     
-    # ── Target: 9 5m-candles ahead (= 45 minutes) ──
+    # ── Target: 9 bars ahead from ENTRY (deferred), not from signal ──
+    # Signal @ bar N, Entry @ bar N+1 (deferred), Hold 9 bars, Exit @ bar N+10
+    # Target: close[N+10] > close[N+1]  (profitable from entry to exit)
+    # shift(-10) instead of shift(-9) to account for +1 deferred entry
     if not for_inference:
-        combined['target'] = (close_5m.shift(-target_candle) > close_5m).astype(float)
+        combined['target'] = (close_5m.shift(-(target_candle + 1)) > close_5m.shift(-1)).astype(float)
     
     # ── Drop NaN rows (need ~200 bars for warmup due to 5m lookback) ──
     if for_inference:
@@ -565,7 +568,7 @@ def compute_5m_features_5tf(
             print(f"    ⚠️ Dropped incomplete 5m bar: {last_idx} (close at {incomplete_close.strftime('%H:%M')}, now={now.strftime('%H:%M')})")
         print(f"    Total features (inference): {len(combined.columns)}")
     else:
-        combined = combined.iloc[200:-target_candle].copy()
+        combined = combined.iloc[200:-(target_candle + 1)].copy()
         print(f"    Total features: {len([c for c in combined.columns if c != 'target'])} + target")
     print(f"    Rows: {len(combined)}")
     
