@@ -513,7 +513,12 @@ class LiveTrader:
                 existing_row = c.fetchone()
                 db_entry_time = existing_row[0] if existing_row and existing_row[0] else 0
                 db_entry_price = existing_row[1] if existing_row and existing_row[1] > 0 else 0
-
+                entry_time = db_entry_time if db_entry_time > 0 else int(time.time() * 1000)
+                if db_entry_time > 0:
+                    hold = self._calc_hold_remaining(entry_time)
+                else:
+                    # Fresh sync from Binance: no DB entry_time → hold=1 so close next cycle
+                    hold = 1
                 entry_price = 0
                 if db_entry_price > 0:
                     entry_price = db_entry_price  # Preserve original from trade execution
@@ -533,8 +538,8 @@ class LiveTrader:
                     # Last-resort fallback (notional = mark-price based, but better than zero)
                     entry_price = abs(notional / pos_amt) if pos_amt != 0 else 0
 
-                entry_time = db_entry_time if db_entry_time > 0 else int(time.time() * 1000)
-                hold = self._calc_hold_remaining(entry_time)
+                # DON'T recalculate hold here — already computed above with
+                # proper fresh-sync handling (hold=1 if no DB entry_time)
                 # Update DB state to match Binance
                 c.execute("""
                     UPDATE live_state
