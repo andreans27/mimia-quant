@@ -245,7 +245,13 @@ def compare_with_production(symbol: str, new_metrics: dict,
         'should_deploy': False,
         'reason': '',
     }
-    
+
+    # Force overrides everything
+    if force:
+        decision['should_deploy'] = True
+        decision['reason'] = 'force_deploy'
+        return decision
+
     if not old:
         new_wr = new_metrics.get('wr', 0)
         new_pf = new_metrics.get('pf', 0)
@@ -284,9 +290,6 @@ def compare_with_production(symbol: str, new_metrics: dict,
     elif new_dd < old_dd * 0.5 and new_pf >= old_pf * 0.9:
         decision['should_deploy'] = True
         decision['reason'] = f'dd_reduced_{old_dd:.2f}%_to_{new_dd:.2f}%'
-    elif force:
-        decision['should_deploy'] = True
-        decision['reason'] = 'force'
     else:
         decision['should_deploy'] = False
         decision['reason'] = f'no_significant_improvement_pf_{new_pf:.2f}_vs_{old_pf:.2f}'
