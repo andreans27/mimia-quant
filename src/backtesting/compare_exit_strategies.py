@@ -175,6 +175,10 @@ def run_backtest(symbol, df, threshold, hold_bars, cooldown_bars, exit_config,
     peak_price = 0.0
     long_pnl = 0.0
     short_pnl = 0.0
+    entry_proba = 0.0  # proba at signal time
+    # Deferred entry: signal at bar N, execute at bar N+1
+    pending_dir = 0       # 1=long, -1=short, 0=none
+    pending_proba = 0.0   # probability at signal time
 
     sl_pct = exit_config.get('sl_pct', 0)
     tp_pct = exit_config.get('tp_pct', 0)
@@ -291,7 +295,7 @@ def run_backtest(symbol, df, threshold, hold_bars, cooldown_bars, exit_config,
                     'exit_price': exit_price,
                     'pnl_net': pnl_net,
                     'pnl_pct': pnl_pct,
-                    'prob_entry': float(row['proba']),
+                    'prob_entry': entry_proba,  # proba from signal bar (N), not exit bar
                     'hold_bars': hold_bars + 1 + cooldown - hold_remaining,
                 })
 
@@ -301,22 +305,18 @@ def run_backtest(symbol, df, threshold, hold_bars, cooldown_bars, exit_config,
                 peak_price = 0.0
                 cooldown = cooldown_bars
 
-        # ── Entry logic (level-based, inline with backtest) ────────
-        if position == 0 and cooldown <= 0:
-            direction = 0
-            if prob_val >= threshold:
-                direction = 1  # long
-                entry_price = price * (1 + SLIPPAGE)
-            elif prob_val <= (1 - threshold):
-                direction = -1  # short
-                entry_price = price * (1 - SLIPPAGE)
+        # ── Entry logic (DEFERRED: signal at bar N, execute at bar N+1) ──
+        # Execute pending signal from PREVIOUS bar first
+        if position == 0 and cooldown <= 0 and pending_dir != 0:
+            direction = pending_dir
+            entry_proba = pending_proba
+            slip = (1 + SLIPPAGE) if direction == 1 else (1 - SLIPPAGE)
+            entry_price = price * slip
 
-            # Apply regime/volatility filters
+            # Apply regime/volatility filters (use current bar's filter state)
             if direction != 0:
-                # ATR volatility filter: skip if entry_mask[idx] is False
                 if entry_mask is not None and not entry_mask[idx]:
                     direction = 0
-                # Trend filter: skip if dir_filter conflicts with direction
                 if direction != 0 and dir_filter is not None and dir_filter[idx] != 0:
                     if (direction == 1 and dir_filter[idx] == -1) or \
                        (direction == -1 and dir_filter[idx] == 1):
@@ -328,7 +328,20 @@ def run_backtest(symbol, df, threshold, hold_bars, cooldown_bars, exit_config,
                 position = direction
                 hold_remaining = hold_bars
                 entry_idx = idx
-                peak_price = entry_price  # init peak for trailing
+                peak_price = entry_price
+                pending_dir = 0  # consumed
+                pending_proba = 0.0
+
+        # Generate new signal for NEXT bar (deferred)
+        pending_dir = 0
+        pending_proba = 0.0
+        if position == 0 and cooldown <= 0:
+            if prob_val >= threshold:
+                pending_dir = 1  # long signal for next bar
+                pending_proba = prob_val
+            elif prob_val <= (1 - threshold):
+                pending_dir = -1  # short signal for next bar
+                pending_proba = prob_val
 
         equity_curve.append(capital)
         timestamps.append(ts)

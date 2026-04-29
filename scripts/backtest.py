@@ -17,13 +17,9 @@ import argparse
 import numpy as np
 from datetime import datetime
 
-from src.trading.backtest import run_backtest
-from src.trading.state import LIVE_SYMBOLS
+from src.trading.backtest import run_backtest, LIVE_SYMBOLS
 
-DEFAULT_SYMBOLS = [
-    'ENAUSDT', 'SOLUSDT', 'INJUSDT', 'ETHUSDT', 'BTCUSDT',
-    'DOGEUSDT', 'TIAUSDT', 'SEIUSDT', 'WIFUSDT', 'NEARUSDT',
-]
+DEFAULT_SYMBOLS = LIVE_SYMBOLS  # all 20 live trading pairs
 
 
 def fmt_pnl(v: float) -> str:

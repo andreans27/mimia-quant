@@ -40,14 +40,15 @@ import xgboost as xgb
 from src.training.train_ml_ensemble import train_full_from_features
 from src.training.train_tf_specific import train_tf_from_features
 
+from src.trading.state import LIVE_SYMBOLS, INITIAL_CAPITAL
+
 # ─── Paths ─────────────────────────────────────────────────────────
 CACHE_DIR = Path("data/ml_cache")
 MODEL_DIR = Path("data/ml_models")
 BACKUP_DIR = MODEL_DIR / "_backups"
 STATUS_FILE = MODEL_DIR / "_retrain_status.json"
 
-SYMBOLS_10 = ['APTUSDT', 'UNIUSDT', 'FETUSDT', 'TIAUSDT', 'SOLUSDT',
-              'OPUSDT', '1000PEPEUSDT', 'SUIUSDT', 'ARBUSDT', 'INJUSDT']
+SYMBOLS_10 = LIVE_SYMBOLS  # Use all 20 live trading symbols
 
 SEEDS = [42, 101, 202, 303, 404]
 TF_GROUPS = ['full', 'm15', 'm30', 'h1', 'h4']
@@ -59,6 +60,7 @@ TRAIN_SPLIT = 0.80  # 80% train, 20% OOS
 IMPROVEMENT_THRESHOLD = 0.02  # 2% F1 improvement to auto-deploy
 
 MIN_TRADES_RETRAIN = 50         # minimum bars after filling/feature gen
+OOS_HOURS = 72                  # OOS validation window (72h = 3 days of unseen data)
 # MODEL_PARAMS and FEATURE_SUBSAMPLE_RATIO retired — replaced by per-seed HPARAMS in imported trainers
 
 
@@ -213,23 +215,31 @@ def train_ensemble(symbol: str, feat_df: pd.DataFrame, target: pd.Series,
 
 def validate_new_models(symbol: str, feat_df: pd.DataFrame = None) -> dict:
     """
-    Run backtest on new models to check actual trading metrics.
-    Returns PF, WR, Sharpe, DD.
-    feat_df: optional pre-computed feature DataFrame (from training)
+    Run proper OOS backtest on new models using deferred-entry engine.
+
+    Uses trading/backtest.run_backtest() which has:
+      - Deferred entry (N+1) — NO look-ahead bias
+      - True OOS window (last OOS_HOURS hours of unseen data)
+      - Same execution logic as live trader
+
+    Returns PF, WR, DD, return_pct, trades.
+    feat_df: ignored (kept for backward compat — engine loads its own data).
     """
-    from src.backtesting.compare_exit_strategies import run_all_strategies
-    results = run_all_strategies(symbol, threshold=0.60, hold_bars=9, cooldown_bars=3, feat_df=feat_df)
-    if results and results.get('baseline'):
-        bl = results['baseline']
-        return {
-            'wr': bl['win_rate_pct'],
-            'pf': bl['profit_factor'],
-            'sharpe': bl['sharpe_ratio'],
-            'dd': bl['max_drawdown_pct'],
-            'return_pct': bl['total_return_pct'],
-            'trades': bl['total_trades'],
-        }
-    return None
+    from src.trading import backtest as bt_engine
+    result = bt_engine.run_backtest(symbol, test_hours=OOS_HOURS, verbose=False)
+    if result is None or result.get('n_trades', 0) < 5:
+        # Fallback: try longer OOS window (168h = 1 week)
+        result = bt_engine.run_backtest(symbol, test_hours=168, verbose=False)
+        if result is None or result.get('n_trades', 0) < 5:
+            return None
+    return {
+        'wr': result['win_rate'],
+        'pf': result['profit_factor'],
+        'sharpe': 0.0,  # not computed by engine
+        'dd': result['max_dd'],
+        'return_pct': result['total_pnl'] / INITIAL_CAPITAL * 100,
+        'trades': result['n_trades'],
+    }
 
 
 def compare_with_production(symbol: str, new_metrics: dict,
@@ -261,8 +271,9 @@ def compare_with_production(symbol: str, new_metrics: dict,
     if not old:
         new_wr = new_metrics.get('wr', 0)
         new_pf = new_metrics.get('pf', 0)
-        # Realistic quality gate for first-time training
-        if new_wr < 55.0 or new_pf < 1.5:
+        # OOS-realistic quality gate for first-time validation
+        # 72h OOS deferred-entry WR is naturally lower than biased in-sample validation
+        if new_wr < 30.0 or new_pf < 0.7:
             decision['should_deploy'] = False
             decision['reason'] = f'quality_gate_failed_wr_{new_wr:.1f}%_pf_{new_pf:.2f}'
             return decision
@@ -282,14 +293,14 @@ def compare_with_production(symbol: str, new_metrics: dict,
     new_dd = new_metrics.get('dd', 99)
     old_dd = old.get('dd', 99)
     
-    # Check improvement
+    # Check improvement (OOS realistic: PF is more meaningful than WR for 72h window)
     pf_improvement = (new_pf - old_pf) / max(old_pf, 0.01)
     wr_improvement = new_wr - old_wr
-    
-    if new_pf > old_pf * (1 + IMPROVEMENT_THRESHOLD) and new_wr >= old_wr:
+
+    if new_pf > old_pf * (1 + 0.10) and new_wr >= old_wr:
         decision['should_deploy'] = True
         decision['reason'] = f'pf_improved_{pf_improvement*100:.1f}%'
-    elif new_wr > old_wr + 2 and new_pf >= old_pf:
+    elif new_wr > old_wr + 5 and new_pf >= old_pf:
         decision['should_deploy'] = True
         decision['reason'] = f'wr_improved_{wr_improvement:.1f}pp'
     elif new_dd < old_dd * 0.5 and new_pf >= old_pf * 0.9:
@@ -301,10 +312,10 @@ def compare_with_production(symbol: str, new_metrics: dict,
     else:
         decision['should_deploy'] = False
         decision['reason'] = f'no_significant_improvement_pf_{new_pf:.2f}_vs_{old_pf:.2f}'
-    
-    # Global quality gate: never deploy models below minimum standards
+
+    # Global quality gate: never deploy models below minimum OOS standards
     if decision['should_deploy']:
-        if new_wr < 55.0 or new_pf < 1.5:
+        if new_wr < 30.0 or new_pf < 0.7:
             decision['should_deploy'] = False
             decision['reason'] = f'quality_gate_wr_{new_wr:.1f}%_pf_{new_pf:.2f}'
     
