@@ -37,6 +37,7 @@ from src.trading.state import (
     THRESHOLD, HOLD_BARS, COOLDOWN_BARS, MARGIN_PCT, LEVERAGE_X,
     TAKER_FEE, SLIPPAGE, MODEL_DIR, SEEDS,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+    get_model_info,
 )
 from src.trading.signals import SignalGenerator
 
@@ -802,7 +803,13 @@ class LiveTrader:
                     if sig and sig.get('signal', 0) != 0:
                         signals_total += 1
                         ts = int(time.time() * 1000)
-                        log_signal(self.conn, symbol, ts, sig['proba'], sig['signal'], capital)
+                        # Calculate data_cutoff: last completed 5m bar close time
+                        bar_minute = (now_utc.minute // 5) * 5
+                        last_bar_close = now_utc.replace(minute=bar_minute, second=0, microsecond=0)
+                        data_cutoff = int(last_bar_close.timestamp() * 1000)
+                        model_info = get_model_info()
+                        log_signal(self.conn, symbol, ts, sig['proba'], sig['signal'], capital,
+                                   data_cutoff=data_cutoff, model_info=model_info)
                         new_signals[symbol] = {
                             'signal': sig['signal'],
                             'proba': sig['proba'],
@@ -871,32 +878,48 @@ class LiveTrader:
         return signals
 
     def _is_bar_ready(self) -> bool:
-        """Check if the latest 5m OHLCV bar is old enough (>= 4.5 min) to be final.
+        """Check if the last COMPLETED 5m bar has settled (age since close >= 3 min).
 
-        Bar settling: Binance may update OHLCV data for ~2-3 min after close.
-        By waiting until >= 4.5 min, we ensure:
-        - The bar data is FINAL (no more settling updates)
-        - The model proba is deterministic (same as backtest)
-        - Entry prices align with bar close (matching backtest)
+        CRITICAL: Checks the last COMPLETE bar (not the latest bar in cache, which
+        may be an incomplete/partial bar). This ensures signal computation uses
+        FINALIZED bar data matching backtest timing:
+          - Backtest: signal at bar N close → execute at bar N+1 close
+          - Live:     signal at last COMPLETE bar → stored pending → execute next bar
+
+        Settling time: 3 min (180s) after bar close gives Binance ~2 min to settle
+        data + 1 min buffer. This replaces the old approach that checked LATEST bar
+        age (which caused 1-2 min delay when a new partial bar appeared).
 
         Returns:
-            True if bar is ready for signal generation, False to skip trading
+            True if the last complete bar is settled enough for signal generation
         """
         try:
-            from src.strategies.ml_features import OHLCV_CACHE_DIR
-            for sym in LIVE_SYMBOLS[:1]:  # Check first symbol as reference
-                # GUNAKAN symbol ASLI — cache sekarang pakai nama Futures symbol
-                # (misal 1000PEPEUSDT_5m.parquet, BUKAN PEPEUSDT_5m.parquet)
-                cache = OHLCV_CACHE_DIR / f"{sym}_5m.parquet"
-                if cache.exists():
-                    df = pd.read_parquet(cache)
-                    latest_ts = df.index[-1]
-                    age_s = (datetime.utcnow() - latest_ts).total_seconds()
-                    # Bar is ready when >= 270 seconds old (4.5 min)
-                    # This gives Binance 2-3 min to settle + buffer
-                    ready = age_s >= 270
-                    print(f"    📡 Latest bar: {latest_ts} (age={age_s:.0f}s) {'READY' if ready else 'WAITING'}")
-                    return ready
+            now = datetime.utcnow()
+            # Find the last COMPLETE 5m bar's open_time
+            # Current 5m window: floor(minute/5)*5
+            # Last complete bar: one window before that
+            this_bar_min = (now.minute // 5) * 5
+            # Handle minute 0-4: this_bar_min = 0, last complete = 55min of prev hour
+            last_complete_open = now.replace(
+                minute=this_bar_min, second=0, microsecond=0
+            ) - timedelta(minutes=5)
+
+            last_complete_close = last_complete_open + timedelta(minutes=5)
+            age_since_close = (now - last_complete_close).total_seconds()
+
+            # Bar close from Binance is final immediately.
+            # No settling needed — backtest uses exact close price too.
+            # Daemon runs at ~:01 (boundary + 1s), so bar close is ~1-60s old.
+            MIN_SETTLE_SEC = 0
+            ready = age_since_close >= MIN_SETTLE_SEC
+            remaining = max(0, MIN_SETTLE_SEC - age_since_close)
+
+            # Log with complete bar info (not latest bar)
+            print(f"    📡 Complete bar: {last_complete_open.strftime('%H:%M')} "
+                  f"(closed {age_since_close:.0f}s ago) "
+                  f"{'READY' if ready else f'WAITING ({remaining:.0f}s more)'}")
+            return ready
+
         except Exception as e:
             print(f"    ⚠️ Bar check failed: {e}")
         return True  # Default: proceed if check fails
@@ -926,11 +949,21 @@ class LiveTrader:
 
         # Step 1: Get bar close price from OHLCV cache (matches backtest reference)
         try:
+            from datetime import datetime, timedelta
             from src.strategies.ml_features import OHLCV_CACHE_DIR
             cache_path = OHLCV_CACHE_DIR / f"{symbol}_5m.parquet"
             if cache_path.exists():
                 df_cache = pd.read_parquet(cache_path)
-                last_close = float(df_cache['close'].iloc[-1])
+                now = datetime.utcnow()
+                last_open = df_cache.index[-1]
+                last_close_time = last_open + timedelta(minutes=5)
+                # Use the last COMPLETE bar's close (skip current incomplete bar)
+                if last_close_time <= now:
+                    last_close = float(df_cache['close'].iloc[-1])
+                else:
+                    # Last bar hasn't closed yet — use the bar before
+                    last_close = float(df_cache['close'].iloc[-2])
+                    print(f"    ⚠️ Latest bar {last_open} incomplete (closes at {last_close_time}), using previous bar close")
                 price_ref = last_close
             else:
                 raise FileNotFoundError("No OHLCV cache")

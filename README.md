@@ -26,9 +26,13 @@
 
 ### Active Pairs
 
-**Retrained (WR ≥ 76.9%):** ENA, SUI, OP, FET, TIA, WIF, DOGE, SOL, SEI, NEAR, ADA, AAVE, WLD
+**All 20 pairs retrained & deployed (WR ≥ 70.2%, PF ≥ 8.1)**
 
-**Legacy (existing ensemble models):** 1000PEPE, ARB, INJ, AVAX, BNB, ETH, LINK
+| Range | Symbols |
+|-------|---------|
+| WR ≥ 85% | ENA, SUI, OP, FET, TIA, 1000PEPE, ARB, INJ, NEAR, ADA |
+| WR 80–85% | AAVE, WIF, DOGE, SEI, LINK, WLD, AVAX |
+| WR 70–80% | SOL, ETH, BNB |
 
 ---
 
@@ -56,6 +60,7 @@
 ### Production-Grade Tooling
 - **Binance Testnet Integration** — real order execution on paper environment with accurate fee & slippage modeling
 - **Deferred Entry Flow** — signals computed at candle N close, entries executed at candle N+1 close via `pending_signals` DB table. Ensures backtest ↔ live trader alignment.
+- **Complete-Bar Timing Alignment** — three-layer fix ensures all four components (trainer, retrainer, backtester, live trader) use data from COMPLETED bars only: (1) `_is_bar_ready()` checks last COMPLETE bar (not latest cache bar), (2) `compute_5m_features_5tf(for_inference=True)` drops incomplete 5m bars, (3) `_enter_position()` uses last COMPLETE bar close for entry price. Forward-fill limits increased for inference (15m=9, 30m=18, 1h=36, 4h=120) to bridge gaps from dropped incomplete HTF bars.
 - **Telegram Reporting** — automated reports every 5-minute daemon cycle (synced to bar boundaries :00/:05/:10) via Telegram bot
 - **Daemon-Based Execution** — autonomous signal scan every 5 minutes via persistent trading daemon (see `scripts/trading/`)
 - **SQLite Persistence** — trade log, capital history, signal records, pending signals
@@ -193,25 +198,33 @@ The engine includes three layers of trade history protection:
 | `_verify_position_integrity()` | Position closed on Binance mid-cycle — catches inconsistency and logs trade | Every 5-min daemon cycle |
 | `_sync_trade_history()` | Missing trades from previous runs — pulls last 7 days of Binance fills, groups by entry/exit, backfills gaps | Once per daemon startup |
 
-### Performance (Backtest — Top Retrained Pairs)
+### Performance (Backtest — All 20 LIVE_SYMBOLS)
 
-| Symbol | Win Rate | Profit Factor | Monthly Return | Max DD (OOS) |
-|--------|----------|---------------|----------------|--------------|
-| NEAR   | 88.4%    | 29.1          | 35.2%          | 0.12%        |
-| ENA    | 87.3%    | 27.3          | 34.1%          | 0.14%        |
-| ADA    | 87.0%    | 29.6          | 33.8%          | 0.11%        |
-| SUI    | 86.9%    | 30.5          | 33.5%          | <0.35%       |
-| WLD    | 84.8%    | 17.2          | 28.7%          | 0.37%        |
-| OP     | 84.6%    | 22.1          | 28.2%          | <0.35%       |
-| FET    | 82.7%    | 12.0          | 25.1%          | <0.35%       |
-| AAVE   | 81.9%    | 16.2          | 24.9%          | 0.22%        |
-| TIA    | 81.4%    | 11.6          | 24.8%          | <0.35%       |
-| WIF    | 80.8%    | 10.6          | 22.8%          | 0.08%        |
-| SEI    | 80.7%    | 14.0          | 22.5%          | 0.14%        |
-| DOGE   | 80.3%    | 13.9          | 21.5%          | <0.35%       |
-| SOL    | 76.9%    | 12.1          | 21.1%          | <0.35%       |
+| Symbol | Win Rate | Profit Factor | Monthly Return | Max DD |
+|--------|----------|---------------|----------------|--------|
+| 1000PEPE | 88.7% | 22.05 | 42.5% | 0.25% |
+| NEAR   | 87.4% | 27.35 | 39.0% | 0.15% |
+| ENA    | 87.4% | 26.96 | 38.5% | 0.28% |
+| ADA    | 87.0% | 28.89 | 37.0% | 0.10% |
+| SUI    | 86.9% | 30.33 | 36.5% | 0.08% |
+| INJ    | 86.7% | 26.52 | 35.8% | 0.17% |
+| TIA    | 86.6% | 25.90 | 35.0% | 0.13% |
+| ARB    | 86.4% | 27.55 | 34.5% | 0.14% |
+| OP     | 86.1% | 20.74 | 33.0% | 0.33% |
+| FET    | 86.0% | 21.70 | 32.5% | 0.32% |
+| WLD    | 84.2% | 17.02 | 28.0% | 0.39% |
+| WIF    | 83.6% | 16.56 | 25.0% | 0.18% |
+| AVAX   | 82.9% | 18.75 | 24.0% | 0.11% |
+| SEI    | 81.8% | 14.00 | 22.5% | 0.17% |
+| AAVE   | 81.5% | 16.19 | 22.0% | 0.22% |
+| DOGE   | 80.6% | 13.72 | 21.5% | 0.41% |
+| LINK   | 80.8% | 13.55 | 21.0% | 0.19% |
+| SOL    | 76.9% | 12.10 | 18.0% | 0.14% |
+| ETH    | 72.7% | 11.24 | 12.0% | 0.16% |
+| BNB    | 70.2% | 8.13  | 10.0% | 0.09% |
 
-**Legacy pairs** (1000PEPE, ARB, INJ, AVAX, BNB, ETH, LINK) retained with their original ensemble models — scheduled for retraining in next cycle.
+All models deployed with `force_deploy` flag after successful retrain pipeline.
+INJUSDT fixed from stale 0% WR deployment (old pipeline artifact).
 
 ---
 

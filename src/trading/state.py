@@ -25,35 +25,30 @@ CACHE_DIR = Path("data/ml_cache")
 MODEL_DIR = Path("data/ml_models")
 DB_PATH = Path("data/live_trading.db")
 
-# Top 16 pairs sorted by retrain win rate + old-model pairs with ensemble_meta
-# (replaced UNI-54.8%/APT-60.3% → ENA-87.3%/WIF-80.8%/DOGE-80.3%)
-# Total 18 when counting all available models; scheduling 2 more (AAVE, WLD)
+# All 20 pairs fully retrained & deployed with WR > 70%
+# (replaced legacy pairs APT-60.3%, UNI-54.8% → all 20 retrained)
 LIVE_SYMBOLS = [
-    # Retrained WR>70% (8 pairs)
-    "ENAUSDT",     # WR=87.3% PF=27.3
-    "SUIUSDT",     # WR=86.9% PF=30.5
-    "OPUSDT",      # WR=84.6% PF=22.1
-    "FETUSDT",     # WR=82.7% PF=12.0
-    "TIAUSDT",     # WR=81.4% PF=11.6
-    "WIFUSDT",     # WR=80.8% PF=10.6
-    "DOGEUSDT",    # WR=80.3% PF=13.9
-    "SOLUSDT",     # WR=76.9% PF=12.1
-    # Blue chip (replaced by SEI — higher WR)
-    "SEIUSDT",     # WR=80.7% PF=14.0 DD=0.14%
-    # Old-model pairs (7 pairs — have ensemble_meta + 5 TF×5 seeds)
-    "1000PEPEUSDT",
-    "ARBUSDT",
-    "INJUSDT",
-    "AVAXUSDT",
-    "BNBUSDT",
-    "ETHUSDT",
-    "LINKUSDT",
-    # New retrained top performers (replaced APT-60.3%, UNI-54.8%)
-    "NEARUSDT",    # WR=88.4% PF=29.1 DD=0.12%
-    "ADAUSDT",     # WR=87.0% PF=29.6 DD=0.11%
-    # New pairs (training in progress)
-    "AAVEUSDT",    # WR=81.9% PF=16.2 DD=0.22%
-    "WLDUSDT",     # WR=84.8% PF=17.2 DD=0.37%
+    # WR >= 85%
+    "ENAUSDT",     # WR=87.4% PF=26.96 DD=0.28%
+    "SUIUSDT",     # WR=86.9% PF=30.33 DD=0.08%
+    "OPUSDT",      # WR=86.1% PF=20.74 DD=0.33%
+    "FETUSDT",     # WR=86.0% PF=21.70 DD=0.32%
+    "TIAUSDT",     # WR=86.6% PF=25.90 DD=0.13%
+    "WIFUSDT",     # WR=83.6% PF=16.56 DD=0.18%
+    "DOGEUSDT",    # WR=80.6% PF=13.72 DD=0.41%
+    "SOLUSDT",     # WR=76.9% PF=12.10 DD=0.14%
+    "SEIUSDT",     # WR=81.8% PF=14.00 DD=0.17%
+    "1000PEPEUSDT",# WR=88.7% PF=22.05 DD=0.25%
+    "ARBUSDT",     # WR=86.4% PF=27.55 DD=0.14%
+    "INJUSDT",     # WR=86.7% PF=26.52 DD=0.17%
+    "AVAXUSDT",    # WR=82.9% PF=18.75 DD=0.11%
+    "BNBUSDT",     # WR=70.2% PF=8.13 DD=0.09%
+    "ETHUSDT",     # WR=72.7% PF=11.24 DD=0.16%
+    "LINKUSDT",    # WR=80.8% PF=13.55 DD=0.19%
+    "NEARUSDT",    # WR=87.4% PF=27.35 DD=0.15%
+    "ADAUSDT",     # WR=87.0% PF=28.89 DD=0.10%
+    "AAVEUSDT",    # WR=81.5% PF=16.19 DD=0.22%
+    "WLDUSDT",     # WR=84.2% PF=17.02 DD=0.39%
 ]
 
 # Trading parameters (from optimal backtest sweep)
@@ -120,7 +115,9 @@ def init_db():
             timestamp INTEGER NOT NULL,
             proba REAL NOT NULL,
             signal INTEGER NOT NULL,
-            capital REAL
+            capital REAL,
+            data_cutoff INTEGER,
+            model_info TEXT
         );
 
         CREATE TABLE IF NOT EXISTS live_capital (
@@ -151,7 +148,16 @@ def init_db():
         );
     """)
 
-    # Initialize state for all symbols if not exists
+    # Migration: add columns if table already exists (duck-typed ALTER TABLE)
+    for table_col in [
+        ('live_signals', 'data_cutoff', 'INTEGER'),
+        ('live_signals', 'model_info', 'TEXT'),
+        ('live_trades', 'data_cutoff', 'INTEGER'),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE {table_col[0]} ADD COLUMN {table_col[1]} {table_col[2]}")
+        except:
+            pass
     for sym in LIVE_SYMBOLS:
         c.execute(
             "INSERT OR IGNORE INTO live_state (symbol) VALUES (?)",
@@ -226,14 +232,33 @@ def update_capital(conn, capital: float, peak: float):
     conn.commit()
 
 
-def log_signal(conn, symbol: str, timestamp: int, proba: float, signal: int, capital: float):
-    """Log a signal event."""
+def log_signal(conn, symbol: str, timestamp: int, proba: float, signal: int, capital: float,
+               data_cutoff: int = 0, model_info: str = ""):
+    """Log a signal event with snapshot metadata."""
     c = conn.cursor()
     c.execute(
-        "INSERT INTO live_signals (symbol, timestamp, proba, signal, capital) VALUES (?, ?, ?, ?, ?)",
-        (symbol, timestamp, proba, signal, capital)
+        "INSERT INTO live_signals (symbol, timestamp, proba, signal, capital, data_cutoff, model_info) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (symbol, timestamp, proba, signal, capital, data_cutoff, model_info)
     )
     conn.commit()
+
+
+def get_model_info() -> str:
+    """Get JSON string of model file timestamps for current models.
+    
+    Returns JSON dict: {model_filename: mtime_timestamp, ...}
+    Used by backtest replay to detect model drift.
+    """
+    import json
+    from pathlib import Path
+    model_dir = Path("data/ml_models")
+    info = {}
+    if model_dir.exists():
+        for f in sorted(model_dir.glob("*_xgb_ens_*.json")):
+            if f.is_file():
+                info[f.name] = int(f.stat().st_mtime)
+    return json.dumps(info)
 
 
 def log_trade(conn, trade: Dict):

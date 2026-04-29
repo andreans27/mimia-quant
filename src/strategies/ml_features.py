@@ -363,12 +363,19 @@ def compute_5m_features_5tf(
     
     # Resample limits: max bars until next candle of that TF closes
     # At inference time, increased limits to bridge gaps from dropped incomplete bars
-    fill_limits = {'15m': 3, '30m': 6, '1h': 12, '4h': 48, '2h': 24, '10m': 2}
+    fill_limits = {'15m': 3, '30m': 6, '1h': 12, '4h': 48}
     if for_inference:
-        # Increase 4h limit to 96 (8h) — last complete 4h bar may be 2 periods back
-        # when the current incomplete bar is dropped
-        fill_limits['4h'] = 96
-        fill_limits['1h'] = 24
+        # Increase limits to handle incomplete HTF bars during live inference.
+        # When current HTF bar is incomplete and dropped, forward-fill must
+        # bridge the gap from last COMPLETE bar to the next one.
+        # 15m: gap = full 15m window (6 5m-bars), safe limit=9
+        # 30m: gap = full 30m window (12 5m-bars), safe limit=18
+        # 1h:  gap = full 60m window (24 5m-bars), safe limit=36
+        # 4h:  gap = full 4h window (96 5m-bars), safe limit=120
+        fill_limits['15m'] = 9
+        fill_limits['30m'] = 18
+        fill_limits['1h'] = 36
+        fill_limits['4h'] = 120
     feat_list = [feats_5m]
     
     for name, df_feat in other_feats.items():
@@ -480,6 +487,16 @@ def compute_5m_features_5tf(
     if for_inference:
         # Keep ALL rows including the most recent ones (no forward-looking target needed)
         combined = combined.iloc[200:].copy()
+        # CRITICAL: Drop last 5m bar if it hasn't closed yet (incomplete data).
+        # A 5m bar at timestamp T closes at T + 5min.
+        # If current_time < T + 5min, the bar's open/high/low/close/volume is NOT final.
+        # Without this check, signal computation uses PARTIAL bar data → unstable probas.
+        now = datetime.utcnow()
+        last_idx = combined.index[-1]
+        incomplete_close = last_idx + timedelta(minutes=5)
+        if incomplete_close > now:
+            combined = combined.iloc[:-1]
+            print(f"    ⚠️ Dropped incomplete 5m bar: {last_idx} (close at {incomplete_close.strftime('%H:%M')}, now={now.strftime('%H:%M')})")
         print(f"    Total features (inference): {len(combined.columns)}")
     else:
         combined = combined.iloc[200:-target_candle].copy()
