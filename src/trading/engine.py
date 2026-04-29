@@ -333,9 +333,14 @@ class LiveTrader:
     def _sync_trade_history(self) -> int:
         """Backfill trade history from Binance for all tracked symbols.
 
-        Called at daemon startup (not every cycle). Pulls the last 7 days
-        of account trade fills from Binance, cross-references against DB,
+        Called at daemon startup (not every cycle). Pulls account trade fills
+        from Binance for the 7-day window, cross-references against DB,
         and logs any trades that are NOT already in the live_trades table.
+
+        IMPORTANT: After a DB reset (fresh start), the 'db_initialized_at'
+        timestamp in the meta table ensures that only trades AFTER the reset
+        are backfilled — preventing old/historical losing trades from polluting
+        the current session's portfolio metrics.
 
         Returns the number of backfilled trades.
         """
@@ -344,10 +349,20 @@ class LiveTrader:
             client = self._get_client()
             c = self.conn.cursor()
 
-            c.execute("SELECT MIN(entry_time) FROM live_trades")
-            min_entry = c.fetchone()[0]
-            seven_days_ago = int((time.time() - 7 * 86400) * 1000)
-            start_time = min_entry if min_entry and min_entry > seven_days_ago else seven_days_ago
+            # Determine start boundary: use db_initialized_at if available
+            c.execute("SELECT value FROM meta WHERE key='db_initialized_at'")
+            row = c.fetchone()
+            if row:
+                db_init = int(row[0])
+                # Only look back max 7 days, but never before db_init
+                seven_days_ago = max(db_init, int((time.time() - 7 * 86400) * 1000))
+                start_time = seven_days_ago
+            else:
+                # Fallback: 7 days (backward compat for existing DBs)
+                seven_days_ago = int((time.time() - 7 * 86400) * 1000)
+                c.execute("SELECT MIN(entry_time) FROM live_trades")
+                min_entry = c.fetchone()[0]
+                start_time = min_entry if min_entry and min_entry > seven_days_ago else seven_days_ago
 
             for symbol in LIVE_SYMBOLS:
                 try:
@@ -447,30 +462,24 @@ class LiveTrader:
         return backfilled
 
     def _sync_wallet_balance(self) -> float:
-        """Sync capital tracking with real Binance wallet balance.
+        """Read Binance wallet balance (informational only — NO DB writes).
 
-        Queries Binance account info and updates the live_capital table
-        with the actual wallet balance (including unrealized PnL).
+        Queries Binance account info and returns the balance. Does NOT
+        update the live_capital table — that is handled centrally by run()
+        using DB-derived capital (INITIAL_CAPITAL + realized PnL).
+
         Returns the synced balance, or 0 if sync fails.
         """
         try:
             client = self._get_client()
             acct = client.get_account_info()
             total_margin = float(acct.get('total_margin_balance', 0))
-            # Use total_margin_balance (wallet + unrealized PnL) for accurate capital tracking
             balance = total_margin if total_margin > 0 else float(acct.get('total_wallet_balance', 0))
             if balance > 0:
-                now_ms = int(time.time() * 1000)
-                c = self.conn.cursor()
-                c.execute("""
-                    INSERT INTO live_capital (timestamp, capital, peak_capital)
-                    VALUES (?, ?, ?)
-                """, (now_ms, balance, balance))
-                self.conn.commit()
-                print(f"  💰 Wallet synced: ${balance:.2f} (from Binance {self.network})")
+                print(f"  💰 Binance wallet: ${balance:.2f} ({self.network})")
                 return balance
             else:
-                print(f"  ⚠️ Wallet balance from Binance is 0 — keeping DB capital")
+                print(f"  ⚠️ Wallet balance from Binance is 0")
                 return 0
         except Exception as e:
             print(f"  ⚠️ Wallet sync failed: {e}")
@@ -566,12 +575,14 @@ class LiveTrader:
         now = datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')
 
         # Get realized PnL from closed trades (DB source of truth)
+        # EXCLUDE history_sync trades — they are old backfill data, not current session
         c = self.conn.cursor()
         c.execute("""
             SELECT COUNT(*), COALESCE(SUM(CASE WHEN pnl_net > 0 THEN 1 ELSE 0 END), 0),
                    COALESCE(SUM(pnl_net), 0), COALESCE(SUM(CASE WHEN pnl_net > 0 THEN pnl_net ELSE 0 END), 0),
                    COALESCE(SUM(CASE WHEN pnl_net < 0 THEN ABS(pnl_net) ELSE 0 END), 0)
             FROM live_trades
+            WHERE exit_reason != 'history_sync'
         """)
         row = c.fetchone()
         total_trades, wins, total_pnl, gross_profit, gross_loss = row
@@ -696,11 +707,23 @@ class LiveTrader:
         if not self._history_synced:
             backfilled = self._sync_trade_history()
             self._history_synced = True
+
+        # Wallet balance sync — INFORMATIONAL ONLY.
+        #   Binance testnet has stale PnL from old trades that distorts our fresh
+        #   start capital. We NEVER let wallet balance override DB-derived capital.
+        #   Use wallet balance only for peak_capital detection.
         synced_balance = self._sync_wallet_balance()
-        if synced_balance > 0 and synced_balance != capital:
-            capital = synced_balance
-            peak_capital = max(peak_capital, capital)
-            update_capital(self.conn, capital, peak_capital)
+
+        # Compute capital from DB trades (source of truth):
+        #   capital = INITIAL_CAPITAL + realized PnL from closed trades
+        #   This isolates performance from Binance wallet drift.
+        c_db = self.conn.cursor()
+        c_db.execute("SELECT COALESCE(SUM(pnl_net), 0) FROM live_trades WHERE exit_reason != 'history_sync'")
+        realized_pnl = c_db.fetchone()[0] or 0.0
+        capital = INITIAL_CAPITAL + realized_pnl
+        if synced_balance > 0:
+            peak_capital = max(peak_capital, synced_balance)
+        update_capital(self.conn, capital, peak_capital)
         self._sync_binance_positions()
         states = get_state(self.conn)
         self._verify_position_integrity(states)
