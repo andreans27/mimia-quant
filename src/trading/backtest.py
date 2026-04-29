@@ -20,6 +20,7 @@ from src.strategies.ml_features import compute_5m_features_5tf
 from src.trading.state import (
     THRESHOLD, HOLD_BARS, COOLDOWN_BARS, TAKER_FEE,
     SLIPPAGE, POSITION_PCT, INITIAL_CAPITAL, LIVE_SYMBOLS,
+    get_symbol_threshold, get_symbol_hold_bars, get_dynamic_position_pct,
 )
 
 WARMUP_BARS = 200
@@ -166,8 +167,9 @@ def run_backtest(symbol: str, test_hours: int = 24,
 
     # Combined signal: LONG if long confident, SHORT if short confident
     all_signals = np.zeros(n_test, dtype=np.int32)
-    long_mask = long_probas >= THRESHOLD
-    short_mask = short_probas >= THRESHOLD
+    sym_threshold = get_symbol_threshold(symbol)
+    long_mask = long_probas >= sym_threshold
+    short_mask = short_probas >= sym_threshold
     # If both signals active, pick higher confidence
     both = long_mask & short_mask
     pick_long = long_probas >= short_probas  # tie → long
@@ -219,10 +221,12 @@ def run_backtest(symbol: str, test_hours: int = 24,
             ep = price * slip
             entry_price_bt = ep
             entry_ts = bar_ts
-            eq = (capital * POSITION_PCT) / ep
+            # Dynamic position sizing based on signal proba
+            pos_size_pct = get_dynamic_position_pct(pproba, symbol)
+            eq = (capital * pos_size_pct) / ep
             capital -= ep * eq * TAKER_FEE
             peak_cap = max(peak_cap, capital)
-            pos = ps; eproba = pproba; hr = HOLD_BARS
+            pos = ps; eproba = pproba; hr = get_symbol_hold_bars(symbol)
 
         # Signal for NEXT bar
         ps = all_signals[test_ii]

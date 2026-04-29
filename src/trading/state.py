@@ -58,6 +58,80 @@ COOLDOWN_BARS = 3   # Wait 15 min between trades
 POSITION_PCT = 0.15 # Risk 15% of capital per trade (deprecated — use MARGIN_PCT * LEVERAGE)
 MARGIN_PCT = 0.01   # 1% of total balance per position
 LEVERAGE_X = 10     # 10x leverage
+
+# ─── Enhanced Parameters ───────────────────────────────────────────
+
+# Per-symbol thresholds: lower for low-freq symbols to increase trade count
+# Default THRESHOLD (0.60) used for symbols not listed here
+SYMBOL_THRESHOLDS = {
+    'BNBUSDT': 0.55,
+    'SOLUSDT': 0.55,
+    'ADAUSDT': 0.55,
+    'LINKUSDT': 0.55,
+    'ETHUSDT': 0.55,
+    'AVAXUSDT': 0.55,
+}
+
+# Per-symbol hold bars based on volatility regime
+# HIGH volatility → shorter hold (less exposure risk)
+# LOW volatility → longer hold (allow more time for TP)
+# Default HOLD_BARS (9) used for symbols not listed here
+HOLD_BARS_PER_SYMBOL = {
+    'WIFUSDT': 8,
+    'DOGEUSDT': 8,
+    '1000PEPEUSDT': 8,
+    'INJUSDT': 8,
+    'ENAUSDT': 8,
+    'ARBUSDT': 8,
+    'SEIUSDT': 8,
+    'TIAUSDT': 8,
+    'BNBUSDT': 12,
+    'ETHUSDT': 12,
+    'LINKUSDT': 12,
+    'SOLUSDT': 12,
+    'ADAUSDT': 11,
+    'AVAXUSDT': 10,
+    'NEARUSDT': 10,
+}
+
+# Dynamic position sizing: proba → position_pct fraction of capital
+# Strategy: only INCREASE position size for high confidence (> 15% baseline).
+# Never decrease — baseline 15% is already validated as optimal.
+#   proba 0.60 → 0.15  (same as baseline)
+#   proba 0.65 → 0.15  (same as baseline)
+#   proba 0.70 → 0.15  (same as baseline)
+#   proba 0.75 → 0.20  (higher confidence → larger position)
+#   proba 0.80 → 0.25  (very high confidence → max)
+SIZE_BY_PROBA = {
+    0.60: 0.15,
+    0.65: 0.15,
+    0.70: 0.15,
+    0.75: 0.20,
+    0.80: 0.25,
+}
+
+def get_symbol_threshold(symbol: str) -> float:
+    """Get per-symbol threshold, fallback to global THRESHOLD."""
+    return SYMBOL_THRESHOLDS.get(symbol, THRESHOLD)
+
+def get_symbol_hold_bars(symbol: str) -> int:
+    """Get per-symbol hold bars, fallback to global HOLD_BARS."""
+    return HOLD_BARS_PER_SYMBOL.get(symbol, HOLD_BARS)
+
+def get_dynamic_position_pct(proba: float, symbol: str = '') -> float:
+    """Get position size based on entry probability.
+    
+    Uses SIZE_BY_PROBA mapping. Falls back to POSITION_PCT if
+    proba is below threshold or not in map.
+    """
+    if proba < THRESHOLD:
+        return POSITION_PCT
+    # Find the closest proba bucket (floor)
+    buckets = sorted(SIZE_BY_PROBA.keys())
+    for b in reversed(buckets):
+        if proba >= b:
+            return SIZE_BY_PROBA[b]
+    return POSITION_PCT
 INITIAL_CAPITAL = 5000.0
 TAKER_FEE = 0.0004  # 0.04%
 SLIPPAGE = 0.0005   # 0.05%

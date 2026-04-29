@@ -24,7 +24,7 @@ import xgboost as xgb
 
 warnings.filterwarnings('ignore')
 
-from src.trading.state import MODEL_DIR, SEEDS, TF_GROUPS, THRESHOLD, FETCH_DAYS
+from src.trading.state import MODEL_DIR, SEEDS, TF_GROUPS, THRESHOLD, FETCH_DAYS, get_symbol_threshold
 from src.strategies.ml_features import OHLCV_CACHE_DIR, OHLCV_FETCH_DAYS
 
 
@@ -387,12 +387,13 @@ class SignalGenerator:
             long_proba = compute_side_proba('long')
             short_proba = compute_side_proba('short')
 
-            # Main signal: pick the higher confidence
-            if long_proba >= THRESHOLD and long_proba >= short_proba:
+            # Main signal: pick the higher confidence with per-symbol threshold
+            threshold = get_symbol_threshold(symbol)
+            if long_proba >= threshold and long_proba >= short_proba:
                 # LONG signal — use long proba
                 proba = long_proba
                 signal = 1
-            elif short_proba >= THRESHOLD:
+            elif short_proba >= threshold:
                 # SHORT signal — use short proba
                 proba = short_proba
                 signal = -1
