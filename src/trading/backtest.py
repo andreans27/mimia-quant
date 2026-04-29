@@ -104,11 +104,11 @@ def run_backtest(symbol: str, test_hours: int = 24,
     if missing_feats:
         log_func(f"⚠️ {len(missing_feats)} model features not in feat_df (will be 0.0)")
 
-    # Pre-compile model refs with feat_df column indices
+    # Pre-compile model refs with mf_to_idx (feat_matrix column indices)
     model_refs = []
     for tg, models in model_groups.items():
         for seed, m, mf in models:
-            avail = [feat_to_col[f] for f in mf if f in feat_to_col]
+            avail = [mf_to_idx[f] for f in mf if f in mf_to_idx]
             if len(avail) >= 5:
                 model_refs.append((m, np.array(avail, dtype=np.int32)))
 
