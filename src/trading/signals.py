@@ -104,10 +104,12 @@ class SignalGenerator:
         ])
         for c in ['open', 'high', 'low', 'close', 'volume']:
             df[c] = pd.to_numeric(df[c], errors='coerce')
-        df['taker_buy_quote'] = pd.to_numeric(df.get('taker_buy_quote', 0), errors='coerce').fillna(0)
+        for col in ['taker_buy_quote', 'quote_volume', 'trades', 'taker_buy_base']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
         df.set_index('open_time', inplace=True)
-        return df[['open', 'high', 'low', 'close', 'volume', 'taker_buy_quote']]
+        return df[['open', 'high', 'low', 'close', 'volume', 'taker_buy_quote', 'quote_volume', 'trades']]
 
     # ── OHLCV Cache (Incremental Update) ─────────────────────────────────
 
@@ -177,10 +179,12 @@ class SignalGenerator:
         ])
         for c in ['open', 'high', 'low', 'close', 'volume']:
             df[c] = pd.to_numeric(df[c], errors='coerce')
-        df['taker_buy_quote'] = pd.to_numeric(df.get('taker_buy_quote', 0), errors='coerce').fillna(0)
+        for col in ['taker_buy_quote', 'quote_volume', 'trades', 'taker_buy_base']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
         df.set_index('open_time', inplace=True)
-        return df[['open', 'high', 'low', 'close', 'volume', 'taker_buy_quote']]
+        return df[['open', 'high', 'low', 'close', 'volume', 'taker_buy_quote', 'quote_volume', 'trades']]
 
     def _ensure_ohlcv_data(self, symbol: str) -> Optional[pd.DataFrame]:
         """Get complete OHLCV data via incremental cache.

@@ -177,9 +177,13 @@ def _fetch_5m_public_klines(symbol: str, days: int = 120) -> Optional[pd.DataFra
     df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
     df.set_index('open_time', inplace=True)
     df = df[~df.index.duplicated(keep='last')].sort_index()
-    # Keep ALL columns: OHLCV + taker_buy data (available from Binance klines)
-    df['taker_buy_quote'] = pd.to_numeric(df.get('taker_buy_quote', 0), errors='coerce').fillna(0)
-    return df[['open', 'high', 'low', 'close', 'volume', 'taker_buy_quote']]
+    # Keep ALL columns: OHLCV + taker_buy + quote_volume + trades (for scalping features)
+    for col in ['taker_buy_quote', 'quote_volume', 'trades', 'taker_buy_base']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    keep = ['open', 'high', 'low', 'close', 'volume', 'taker_buy_quote', 'quote_volume', 'trades']
+    available = [c for c in keep if c in df.columns]
+    return df[available]
 
 
 def resample_to_timeframes(
@@ -228,9 +232,10 @@ def resample_to_timeframes(
             'close': 'last',
             'volume': 'sum',
         }
-        # Include taker_buy_quote if available (sum aggregates across bars)
-        if 'taker_buy_quote' in df_5m.columns:
-            agg_dict['taker_buy_quote'] = 'sum'
+        # Include additional columns if available
+        for extra_col in ['taker_buy_quote', 'quote_volume', 'trades']:
+            if extra_col in df_5m.columns:
+                agg_dict[extra_col] = 'sum'
 
         resampled = df_5m.resample(rule).agg(agg_dict).dropna()
 
@@ -385,7 +390,7 @@ def compute_technical_features(df: pd.DataFrame, prefix: str = "", drop_raw: boo
 
     # Drop raw OHLCV columns to avoid duplicates across timeframes (if requested)
     if drop_raw:
-        for col in ["open", "high", "low", "close", "volume", "taker_buy_quote"]:
+        for col in ["open", "high", "low", "close", "volume", "taker_buy_quote", "quote_volume", "trades"]:
             if col in result.columns:
                 del result[col]
 
@@ -618,32 +623,70 @@ def compute_5m_features_5tf(
     # ── Combine ALL features ──
     combined = pd.concat([combined, xtf], axis=1)
 
-    # ── TAKER BUY RATIO FEATURES (from OHLCV taker_buy_quote) ──────────
-    # taker_buy_quote is now preserved in df_5m cache — available for ALL training data
-    if 'taker_buy_quote' in df_5m_full.columns:
+    # ── MICRO-STRUCTURE SCALPING FEATURES (from klines) ───────────
+    # taker_buy_quote, quote_volume, trades are now preserved in OHLCV cache
+    if 'taker_buy_quote' in df_5m_full.columns and 'quote_volume' in df_5m_full.columns:
         close_full = df_5m_full['close'].astype(float)
         taker_quote = df_5m_full['taker_buy_quote'].astype(float).fillna(0)
+        quote_vol = df_5m_full['quote_volume'].astype(float).fillna(0)
+        trades = df_5m_full['trades'].astype(float).fillna(0)
         volume_full = df_5m_full['volume'].astype(float).fillna(0)
-
-        # taker_buy_ratio: % of volume that was aggressive buying (0-1)
-        total_quote = close_full * volume_full
+        
+        # ── 1. TAKER BUY RATIO (accurate — using quote_volume directly) ──
+        total_quote = quote_vol  # direct from Binance — more accurate than close*volume
         taker_buy_ratio = taker_quote / total_quote.replace(0, np.nan)
-        taker_buy_ratio = taker_buy_ratio.fillna(0.5).clip(0, 1)  # 0.5 = neutral
-
-        # Align to combined index
+        taker_buy_ratio = taker_buy_ratio.fillna(0.5).clip(0, 1)
+        
         tbr = taker_buy_ratio.reindex(combined.index)
-
         combined['taker_buy_ratio'] = tbr
-        # Rolling stats
-        for w in [12, 24, 48, 96, 192]:  # 1h, 2h, 4h, 8h, 16h at 5m
-            combined[f'taker_buy_ratio_sma_{w}'] = tbr.rolling(w, min_periods=5).mean()
+        for w in [6, 12, 24, 48, 96]:  # 30m, 1h, 2h, 4h, 8h at 5m
+            combined[f'taker_buy_ratio_sma_{w}'] = tbr.rolling(w, min_periods=3).mean()
             combined[f'taker_buy_ratio_zscore_{w}'] = (
-                (tbr - tbr.rolling(w, min_periods=5).mean())
-                / tbr.rolling(w, min_periods=5).std().replace(0, np.nan)
+                (tbr - tbr.rolling(w, min_periods=3).mean())
+                / tbr.rolling(w, min_periods=3).std().replace(0, np.nan)
             ).fillna(0)
-        # Extreme buying/selling signals
-        combined['taker_buy_extreme'] = (tbr > 0.75).astype(float)   # heavy buying
-        combined['taker_sell_extreme'] = (tbr < 0.25).astype(float)  # heavy selling
+        combined['taker_buy_extreme'] = (tbr > 0.75).astype(float)
+        combined['taker_sell_extreme'] = (tbr < 0.25).astype(float)
+        
+        # ── 2. TRADE FREQUENCY (scalping: spike in trades = volatility) ──
+        num_trades = trades.reindex(combined.index)
+        combined['num_trades'] = num_trades
+        for w in [6, 12, 24]:
+            combined[f'trade_freq_zscore_{w}'] = (
+                (num_trades - num_trades.rolling(w, min_periods=3).mean())
+                / num_trades.rolling(w, min_periods=3).std().replace(0, np.nan)
+            ).fillna(0)
+        combined['trade_spike'] = (num_trades > num_trades.rolling(24).mean() * 2).astype(float)
+        
+        # ── 3. AVERAGE TRADE SIZE (micro-structure: whale trades vs retail) ──
+        avg_size = quote_vol / trades.replace(0, np.nan)
+        avg_size = avg_size.fillna(0)
+        avg_size_aligned = avg_size.reindex(combined.index)
+        combined['avg_trade_size'] = avg_size_aligned
+        for w in [6, 12, 24]:
+            combined[f'avg_trade_size_zscore_{w}'] = (
+                (avg_size_aligned - avg_size_aligned.rolling(w, min_periods=3).mean())
+                / avg_size_aligned.rolling(w, min_periods=3).std().replace(0, np.nan)
+            ).fillna(0)
+        
+        # ── 4. MICRO MOMENTUM (candle body: close - open) ──
+        open_full = df_5m_full['open'].astype(float)
+        body = close_full - open_full
+        body_aligned = body.reindex(combined.index)
+        combined['micro_body'] = body_aligned / close_full.reindex(combined.index).replace(0, np.nan) * 100  # %
+        combined['micro_body_abs'] = abs(body_aligned) / close_full.reindex(combined.index).replace(0, np.nan) * 100
+        for w in [3, 6, 12]:  # 15m, 30m, 1h
+            combined[f'micro_body_roll_{w}'] = body_aligned.rolling(w).sum()
+            combined[f'micro_hl_range_{w}'] = (
+                df_5m_full['high'].astype(float).rolling(w).max()
+                - df_5m_full['low'].astype(float).rolling(w).min()
+            ).reindex(combined.index) / close_full.reindex(combined.index).replace(0, np.nan) * 100
+        
+        # ── 5. QUOTE VOLUME FLOW ──
+        qv = quote_vol.reindex(combined.index)
+        combined['quote_volume'] = qv
+        for w in [6, 12, 24]:
+            combined[f'quote_vol_ratio_{w}'] = qv / qv.rolling(w, min_periods=3).mean().replace(0, np.nan)
 
     # ── MARKET DATA FEATURES (Funding Rate, OI, Top Trader) ────────────
     # These are fetched from cache and aligned to 5m index
@@ -894,5 +937,9 @@ def _fetch_all_klines(client, symbol: str, interval: str, start_ms: int, end_ms:
     df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
     df.set_index('open_time', inplace=True)
     df = df[~df.index.duplicated(keep='last')].sort_index()
-    df['taker_buy_quote'] = pd.to_numeric(df.get('taker_buy_quote', 0), errors='coerce').fillna(0)
-    return df[['open', 'high', 'low', 'close', 'volume', 'taker_buy_quote']]
+    for col in ['taker_buy_quote', 'quote_volume', 'trades', 'taker_buy_base']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    keep = ['open', 'high', 'low', 'close', 'volume', 'taker_buy_quote', 'quote_volume', 'trades']
+    available = [c for c in keep if c in df.columns]
+    return df[available]
