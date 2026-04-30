@@ -11,7 +11,7 @@ sys.path.insert(0, os.getcwd())
 import numpy as np
 import xgboost as xgb
 from sklearn.metrics import roc_auc_score
-from src.strategies.ml_features import ensure_ohlcv_data, compute_5m_features_5tf
+from src.strategies.ml_features import ensure_ohlcv_data, ensure_ohlcv_1h, compute_5m_features_5tf
 from src.trading.state import LIVE_SYMBOLS, MODEL_DIR, SEEDS
 
 HPARAMS = {
@@ -35,7 +35,12 @@ for idx, symbol in enumerate(LIVE_SYMBOLS):
             print(f"[{idx+1:2d}/20] {symbol:>15s}: SKIP (data)")
             continue
         
-        feat_df = compute_5m_features_5tf(df_5m, target_candle=9, target_threshold=0.005, intervals=['1h'], for_inference=False)
+        # Fetch 1h OHLCV DIRECTLY from Binance (no look-ahead from resample)
+        df_1h = ensure_ohlcv_1h(symbol, min_days=max(TRAIN_DAYS, 20))
+        if df_1h is not None:
+            print(f"    ✅ 1h: {len(df_1h)} bars (direct from Binance)")
+        
+        feat_df = compute_5m_features_5tf(df_5m, target_candle=9, target_threshold=0.005, intervals=['1h'], for_inference=False, df_1h=df_1h)
         if len(feat_df) < 300:
             print(f"[{idx+1:2d}/20] {symbol:>15s}: SKIP (feats={len(feat_df)})")
             continue

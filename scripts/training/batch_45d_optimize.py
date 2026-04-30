@@ -26,7 +26,7 @@ import xgboost as xgb
 from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, precision_score, recall_score
 
 from src.strategies.ml_features import (
-    ensure_ohlcv_data, compute_5m_features_5tf,
+    ensure_ohlcv_data, ensure_ohlcv_1h, compute_5m_features_5tf,
     prepare_ml_dataset
 )
 from src.strategies.market_data_cache import ensure_all_market_data
@@ -60,10 +60,13 @@ def train_symbol_45d(symbol: str) -> dict:
             return {'symbol': symbol, 'status': 'fail', 'error': 'insufficient OHLCV'}
 
         # 2. Compute features
+        df_1h = ensure_ohlcv_1h(symbol, min_days=max(TRAIN_DAYS, 20))
+        if df_1h is not None:
+            print(f"    ✅ 1h: {len(df_1h)} bars (direct from Binance)")
         feat_df = compute_5m_features_5tf(
             df_5m, target_candle=TARGET_CANDLE,
             target_threshold=TARGET_THRESHOLD,
-            intervals=['1h'], for_inference=False
+            intervals=['1h'], for_inference=False, df_1h=df_1h
         )
         if len(feat_df) < 500:
             return {'symbol': symbol, 'status': 'fail', 'error': f'insufficient features: {len(feat_df)}'}

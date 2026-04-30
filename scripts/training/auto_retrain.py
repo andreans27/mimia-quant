@@ -92,7 +92,7 @@ def compute_target(df: pd.DataFrame, forward_bars: int = 3) -> pd.Series:
 
 def compute_features_5tf(ohlcv: pd.DataFrame, symbol: str) -> pd.DataFrame:
     """Compute all 372 features (or reuse cached)."""
-    from src.strategies.ml_features import compute_5m_features_5tf
+    from src.strategies.ml_features import compute_5m_features_5tf, ensure_ohlcv_1h
 
     # Check cache
     cache_dir = Path("data/ml_cache")
@@ -102,7 +102,11 @@ def compute_features_5tf(ohlcv: pd.DataFrame, symbol: str) -> pd.DataFrame:
         print(f"  Loading cached features for {symbol}...")
         return pd.read_parquet(cache_path)
 
-    feat_df = compute_5m_features_5tf(ohlcv)
+    # Fetch 1h OHLCV directly (no look-ahead from resample)
+    df_1h = ensure_ohlcv_1h(symbol, min_days=7)
+    if df_1h is not None:
+        print(f"    ✅ 1h: {len(df_1h)} bars (direct from Binance)")
+    feat_df = compute_5m_features_5tf(ohlcv, df_1h=df_1h)
 
     # Save to cache
     feat_df.to_parquet(cache_path)

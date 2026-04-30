@@ -654,7 +654,17 @@ def compute_5m_features_5tf(
             # No 1h features — create empty aligned DataFrame
             aligned = pd.DataFrame(index=idx_5m, columns=[])
         else:
-            aligned = df_feat.reindex(idx_5m, method='ffill', limit=limit)
+            # CRITICAL: Shift 1h index by 1h during training to prevent look-ahead
+            # Without shift: 1h bar at 10:00 (OHLC for 10:00-10:59) is forward-filled
+            # to 5m bar at 10:05 — using close from 10:59 at 10:05 = LOOK-AHEAD
+            # With shift: 1h bar at 10:00 → index 11:00 (only available from 11:00)
+            # At 10:05, ffill uses 09:00 bar (complete at 10:00) = CORRECT
+            if name == '1h' and not per_bar and not for_inference:
+                df_shifted = df_feat.copy()
+                df_shifted.index = df_shifted.index + timedelta(hours=1)
+                aligned = df_shifted.reindex(idx_5m, method='ffill', limit=limit)
+            else:
+                aligned = df_feat.reindex(idx_5m, method='ffill', limit=limit)
         feat_list.append(aligned)
     
     combined = pd.concat(feat_list, axis=1)

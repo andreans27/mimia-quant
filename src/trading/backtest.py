@@ -19,7 +19,7 @@ from typing import Optional, Dict, List, Tuple
 from src.trading.signals import SignalGenerator
 from src.strategies.ml_features import (
     compute_5m_features_5tf, compute_technical_features,
-    resample_to_timeframes,
+    resample_to_timeframes, ensure_ohlcv_1h,
 )
 from src.trading.state import (
     THRESHOLD, HOLD_BARS, COOLDOWN_BARS, TAKER_FEE,
@@ -55,7 +55,11 @@ def run_backtest(symbol: str, test_hours: int = 24,
         log_func("❌ No data")
         return None
 
-    feat_df = compute_5m_features_5tf(df_5m, for_inference=True)
+    df_1h = ensure_ohlcv_1h(symbol, min_days=20)
+    if df_1h is not None:
+        log_func(f"  1h: {len(df_1h)} bars (direct from Binance)")
+
+    feat_df = compute_5m_features_5tf(df_5m, for_inference=True, df_1h=df_1h)
     if feat_df is None or len(feat_df) < 500:
         log_func("❌ Feature computation failed")
         return None
@@ -301,10 +305,32 @@ def run_backtest_live_aligned(
     feats_5m = _get_5m_features_cached(df_5m, symbol)
     log_func(f"  5m features: {len(feats_5m.columns)} cols, {len(feats_5m)} rows")
 
-    # Pre-compute 1h OHLCV from full data (for reference, will subset per bar)
-    tf_data_full = resample_to_timeframes(df_5m, ['1h'])
-    full_1h_ohlcv = tf_data_full['1h']
-    log_func(f"  1h OHLCV: {len(full_1h_ohlcv)} bars from full data")
+    # Pre-compute 1h OHLCV DIRECTLY from Binance (NO resample look-ahead)
+    full_1h_ohlcv = ensure_ohlcv_1h(symbol, min_days=20)
+    if full_1h_ohlcv is None or len(full_1h_ohlcv) < 10:
+        log_func("❌ No 1h OHLCV data")
+        return None
+    n_1h_total = len(full_1h_ohlcv)
+    
+    # Pre-compute 1h features ONCE (all bars) — per-bar slice will select available
+    # This ensures rolling indicators (RSI-14, ATR-14, etc.) are computed from
+    # the FULL 1h history, not just the first few incomplete bars.
+    full_1h_feats = compute_technical_features(full_1h_ohlcv, prefix='h1_')
+    log_func(f"  1h OHLCV: {n_1h_total} bars + {len(full_1h_feats.columns)} feats (direct, no look-ahead)")
+    
+    # Pre-compute FULL feature matrix (ALL 220 features including market, micro, cross-TF)
+    # Then override h1 features per bar with correctly-sliced versions
+    full_feat_matrix = compute_5m_features_5tf(
+        df_5m, for_inference=True, df_1h=full_1h_ohlcv
+    )
+    log_func(f"  Full feat matrix: {len(full_feat_matrix)} rows, {len(full_feat_matrix.columns)} cols")
+    
+    # Identify h1 column prefixes for override
+    h1_prefixes = tuple(c for c in full_feat_matrix.columns if c.startswith('h1_'))
+    h1_prefixes += tuple(c for c in full_feat_matrix.columns if c in (
+        '1h_bullish', 'vol_ratio_5m_vs_1h', 'rsi_div_5m_vs_1h',
+        'vol_5m_vs_1h_avg', 'consolidation_ratio', 'is_consolidating',
+    ))
 
     all_model_feats = sorted(set(
         f for _, models in model_groups.items()
@@ -361,8 +387,15 @@ def run_backtest_live_aligned(
             print(f"  Bar {ii}/{n_test} ({bar_ts})")
 
         # --- Efficient per-bar feature computation ---
-        # 1. How many complete 1h bars at bar index bi?
-        n_complete_1h = bi // 12  # 12 5m bars = 1 complete 1h bar
+        # 1. How many complete 1h bars at this calendar time?
+        #    Use FULL 1h OHLCV from Binance — each 1h bar is complete at close_time
+        #    CRITICAL: bi // 12 is WRONG when 5m data doesn't start at hour boundary
+        #    Instead: count 1h bars with close_time <= bar_ts
+        n_complete_1h = int(np.searchsorted(
+            full_1h_ohlcv.index + timedelta(hours=1),
+            bar_ts,
+            side='right'
+        ))
         # 2. Worst case: also need warmup. ffilled features need at least some.
         #    If < 1 complete 1h bar: all 1h features are NaN → skip
         if n_complete_1h < 1:
@@ -372,76 +405,81 @@ def run_backtest_live_aligned(
             short_probas_list.append(0.5)
             continue
 
-        # 3. Pre-compute 1h features from available 1h bars
-        #    (only bars 0 to n_complete_1h-1 are available)
-        available_1h = full_1h_ohlcv.iloc[:n_complete_1h].copy()
-        if len(available_1h) == 0:
+        # 3. Select 1h features from the LAST complete 1h bar
+        #    (computed from FULL 1h history — correct RSI, ATR, etc.)
+        if n_complete_1h - 1 >= len(full_1h_feats):
             timestamps.append(bar_ts)
             signals_list.append(0)
             long_probas_list.append(0.5)
             short_probas_list.append(0.5)
             continue
-
-        # 4. Compute 1h features (fast — only on N available bars)
-        feats_1h = compute_technical_features(available_1h, prefix='h1_')
-        # 5. Align 1h to this bar's 5m index (ffill)
-        idx_target = pd.DatetimeIndex([bar_ts])
-        feats_1h_aligned = feats_1h.reindex(idx_target, method='ffill', limit=12)
-
-        # 6. Combine 5m features (pre-computed) + 1h features
-        combined = pd.concat([feats_5m.loc[[bar_ts]], feats_1h_aligned], axis=1)
-
-        # 7. Cross-TF features (matching compute_5m_features_5tf exactly)
-        # Use data available at this point in time
-        close_5m_bar = df_5m['close'].astype(float).loc[:bar_ts]  # 5m data up to now
-        volume_5m_bar = df_5m['volume'].astype(float).loc[:bar_ts]
-        close_1h_bar = available_1h['close'].astype(float)
         
-        if 'h1_atr_14' in feats_1h_aligned.columns:
-            atr_5m = feats_5m.loc[bar_ts, 'm5_atr_14']
-            atr_1h = feats_1h_aligned['h1_atr_14'].values[0]
-            combined['vol_ratio_5m_vs_1h'] = atr_5m / atr_1h if not pd.isna(atr_1h) and atr_1h != 0 else np.nan
+        # Get ALL features from pre-computed matrix (5m, market, micro, cross-TF)
+        if bar_ts not in full_feat_matrix.index:
+            timestamps.append(bar_ts)
+            signals_list.append(0)
+            long_probas_list.append(0.5)
+            short_probas_list.append(0.5)
+            continue
+        combined = full_feat_matrix.loc[[bar_ts]].copy()
         
-        if 'h1_rsi_14' in feats_1h_aligned.columns:
-            rsi_5m = feats_5m.loc[bar_ts, 'm5_rsi_14']
-            rsi_1h = feats_1h_aligned['h1_rsi_14'].values[0]
-            combined['rsi_div_5m_vs_1h'] = rsi_5m - rsi_1h
-        
-        # 1h Trend regime
-        if len(close_1h_bar) > 0:
-            for period in [20, 50]:
-                sma = close_1h_bar.rolling(period).mean()
-                if len(sma.dropna()) > 0:
-                    trend_val = 0
-                    if sma.iloc[-1] > sma.shift(1).iloc[-1] if not pd.isna(sma.shift(1).iloc[-1]) else False:
-                        trend_val = 1
-                    elif sma.iloc[-1] < sma.shift(1).iloc[-1] if not pd.isna(sma.shift(1).iloc[-1]) else False:
-                        trend_val = -1
-                    combined[f'h1_trend_sma{period}'] = trend_val
-        
-        # Volume ratio: 5m volume vs 1h average volume
-        if len(volume_5m_bar) >= 12:
-            vol_1h_avg = volume_5m_bar.rolling(12).sum().resample('1h').mean()
-            if len(vol_1h_avg.dropna()) > 0 and not pd.isna(vol_1h_avg.iloc[-1]):
-                combined['vol_5m_vs_1h_avg'] = volume_5m_bar.iloc[-1] / vol_1h_avg.iloc[-1] if vol_1h_avg.iloc[-1] != 0 else np.nan
-        
-        # Consolidation detection
-        high_5m_bar = df_5m['high'].astype(float).loc[:bar_ts]
-        low_5m_bar = df_5m['low'].astype(float).loc[:bar_ts]
-        range_5m_20_bar = (high_5m_bar.rolling(20).max() - low_5m_bar.rolling(20).min())
-        if len(available_1h) > 0:
-            range_1h_20_bar = (available_1h['high'].astype(float).rolling(20).mean() 
-                              - available_1h['low'].astype(float).rolling(20).mean())
-            if not pd.isna(range_5m_20_bar.iloc[-1]) and not pd.isna(range_1h_20_bar.iloc[-1]) and range_1h_20_bar.iloc[-1] != 0:
-                combined['consolidation_ratio'] = range_5m_20_bar.iloc[-1] / range_1h_20_bar.iloc[-1]
-            if not pd.isna(range_5m_20_bar.iloc[-1]):
-                combined['is_consolidating'] = float(range_5m_20_bar.iloc[-1] < range_5m_20_bar.rolling(40).mean().iloc[-1] * 0.5)
-        
-        # 1h bullish alignment
-        if len(close_1h_bar) >= 20:
-            sma20_1h = close_1h_bar.rolling(20).mean()
-            if len(sma20_1h.dropna()) > 0:
-                combined['1h_bullish'] = 1.0 if close_1h_bar.iloc[-1] > sma20_1h.iloc[-1] else 0.0
+        # Override h1 features with correctly-sliced per-bar version
+        feats_1h_aligned = full_1h_feats.iloc[[n_complete_1h - 1]].copy()
+        feats_1h_aligned.index = [bar_ts]
+        for col in h1_prefixes:
+            if col in feats_1h_aligned.columns:
+                combined[col] = feats_1h_aligned[col].values[0]
+            elif col in combined.columns:
+                # Column exists in full_feat_matrix but not in h1_feats — set to NaN
+                # (it's a cross-TF feature that depends on 1h data)
+                # Recompute it from available_1h data
+                available_1h_close = full_1h_ohlcv.iloc[:n_complete_1h]['close'].astype(float)
+                available_1h_candle = full_1h_ohlcv.iloc[:n_complete_1h]
+                
+                if col == 'vol_ratio_5m_vs_1h':
+                    atr_5m = feats_5m.loc[bar_ts, 'm5_atr_14'] if 'm5_atr_14' in feats_5m.columns else np.nan
+                    atr_1h = feats_1h_aligned['h1_atr_14'].values[0] if 'h1_atr_14' in feats_1h_aligned.columns else np.nan
+                    if not pd.isna(atr_1h) and atr_1h != 0:
+                        combined[col] = atr_5m / atr_1h
+                elif col == 'rsi_div_5m_vs_1h':
+                    rsi_5m = feats_5m.loc[bar_ts, 'm5_rsi_14'] if 'm5_rsi_14' in feats_5m.columns else np.nan
+                    rsi_1h = feats_1h_aligned['h1_rsi_14'].values[0] if 'h1_rsi_14' in feats_1h_aligned.columns else np.nan
+                    combined[col] = rsi_5m - rsi_1h
+                elif col == '1h_bullish':
+                    if len(available_1h_close) >= 20:
+                        sma20 = available_1h_close.rolling(20).mean()
+                        if len(sma20.dropna()) > 0:
+                            combined[col] = 1.0 if available_1h_close.iloc[-1] > sma20.iloc[-1] else 0.0
+                elif col == 'consolidation_ratio':
+                    range_5m = (df_5m['high'].astype(float).loc[:bar_ts].rolling(20).max() 
+                               - df_5m['low'].astype(float).loc[:bar_ts].rolling(20).min())
+                    if len(available_1h_candle) > 0:
+                        range_1h = (available_1h_candle['high'].astype(float).rolling(20).mean() 
+                                   - available_1h_candle['low'].astype(float).rolling(20).mean())
+                        if not pd.isna(range_5m.iloc[-1]) and not pd.isna(range_1h.iloc[-1]) and range_1h.iloc[-1] != 0:
+                            combined[col] = range_5m.iloc[-1] / range_1h.iloc[-1]
+                elif col == 'is_consolidating':
+                    range_5m = (df_5m['high'].astype(float).loc[:bar_ts].rolling(20).max() 
+                               - df_5m['low'].astype(float).loc[:bar_ts].rolling(20).min())
+                    if not pd.isna(range_5m.iloc[-1]):
+                        combined[col] = float(range_5m.iloc[-1] < range_5m.rolling(40).mean().iloc[-1] * 0.5)
+                elif col == 'vol_5m_vs_1h_avg':
+                    volume_5m = df_5m['volume'].astype(float).loc[:bar_ts]
+                    if len(volume_5m) >= 12:
+                        vol_avg = volume_5m.rolling(12).sum().resample('1h').mean()
+                        if len(vol_avg.dropna()) > 0 and vol_avg.iloc[-1] != 0:
+                            combined[col] = volume_5m.iloc[-1] / vol_avg.iloc[-1]
+                elif col.startswith('h1_trend_sma'):
+                    period = int(col.replace('h1_trend_sma', ''))
+                    if len(available_1h_close) > 0:
+                        sma = available_1h_close.rolling(period).mean()
+                        if len(sma.dropna()) > 0:
+                            trend = 0
+                            if sma.iloc[-1] > sma.shift(1).iloc[-1] if not pd.isna(sma.shift(1).iloc[-1]) else False:
+                                trend = 1
+                            elif sma.iloc[-1] < sma.shift(1).iloc[-1] if not pd.isna(sma.shift(1).iloc[-1]) else False:
+                                trend = -1
+                            combined[col] = trend
 
         # ── Build model input ──
         feat_cols = list(combined.columns)
