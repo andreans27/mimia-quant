@@ -545,6 +545,7 @@ def compute_5m_features_5tf(
     available_until: Optional[int] = None,
     market_data: Optional[Dict] = None,
     df_1h: Optional[pd.DataFrame] = None,
+    symbol: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Simplified feature computation: 5m execution + 1h predictive features.
@@ -815,12 +816,11 @@ def compute_5m_features_5tf(
 
         if market_data is None:
             # Auto-fetch from cache (fast — parquet files)
-            market_data = ensure_all_market_data(
-                # We don't have symbol here, but that's fine — cache files exist
-                # For training, market_data is passed in from prepare_ml_dataset
-            )
-            market_data = None  # can't auto-fetch without symbol
-
+            if symbol is not None:
+                market_data = ensure_all_market_data(symbol)
+            else:
+                market_data = None  # can't auto-fetch without symbol
+        
         if market_data is not None:
             idx_5m_aligned = combined.index
 

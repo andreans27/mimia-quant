@@ -59,7 +59,7 @@ def run_backtest(symbol: str, test_hours: int = 24,
     if df_1h is not None:
         log_func(f"  1h: {len(df_1h)} bars (direct from Binance)")
 
-    feat_df = compute_5m_features_5tf(df_5m, for_inference=True, df_1h=df_1h)
+    feat_df = compute_5m_features_5tf(df_5m, for_inference=True, df_1h=df_1h, symbol=symbol)
     if feat_df is None or len(feat_df) < 500:
         log_func("❌ Feature computation failed")
         return None
@@ -321,8 +321,11 @@ def run_backtest_live_aligned(
     # Pre-compute FULL feature matrix (ALL 220 features including market, micro, cross-TF)
     # Then override h1 features per bar with correctly-sliced versions
     full_feat_matrix = compute_5m_features_5tf(
-        df_5m, for_inference=True, df_1h=full_1h_ohlcv
+        df_5m, for_inference=True, df_1h=full_1h_ohlcv, symbol=symbol
     )
+    if full_feat_matrix is None or len(full_feat_matrix) < 500:
+        log_func("❌ Full feature matrix failed")
+        return None
     log_func(f"  Full feat matrix: {len(full_feat_matrix)} rows, {len(full_feat_matrix.columns)} cols")
     
     # Identify h1 column prefixes for override
