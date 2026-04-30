@@ -30,6 +30,87 @@ OHLCV_FETCH_DAYS = 120  # Days of 5m data to fetch on first run
 # causing corruption. Lock files are per-symbol and auto-expire after 30s.
 CACHE_LOCK_TIMEOUT = 30  # seconds
 
+# ── 1h OHLCV Cache (independent from 5m — NO look-ahead bias) ──
+# 1h klines are fetched DIRECTLY from Binance (not resampled from 5m).
+# Each 1h bar is a complete historical entity — safe for training & inference.
+OHLCV_CACHE_1H_DAYS = 120
+
+
+def ensure_ohlcv_1h(symbol: str, min_days: int = 120) -> Optional[pd.DataFrame]:
+    """Fetch 1h OHLCV DIRECTLY from Binance (NOT resampled from 5m).
+    Each 1h bar is a complete historical entity — eliminates look-ahead bias.
+    Uses the SAME public Futures API as 5m cache.
+    """
+    cache_path = OHLCV_CACHE_DIR / f"{symbol}_1h.parquet"
+
+    # Check cache
+    if cache_path.exists():
+        df = pd.read_parquet(cache_path)
+        min_bars = min_days * 24
+        if len(df) >= min_bars:
+            return df
+        print(f"  1h Cache has {len(df)} bars (need {min_bars}), refreshing...")
+
+    # Fetch from Binance public Futures API
+    import requests
+    end = datetime.now()
+    start = end - timedelta(days=min_days)
+    start_ms = int(start.timestamp() * 1000)
+    end_ms = int(end.timestamp() * 1000)
+
+    limit = 1000
+    all_bars = []
+    last_ts = start_ms
+    url = "https://fapi.binance.com/fapi/v1/klines"
+
+    while last_ts < end_ms:
+        params = {
+            'symbol': symbol,
+            'interval': '1h',
+            'limit': limit,
+            'startTime': last_ts,
+            'endTime': end_ms,
+        }
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            if r.status_code != 200:
+                break
+            batch = r.json()
+            if not batch:
+                break
+            all_bars.extend(batch)
+            last_ts = batch[-1][0] + 1
+            if len(batch) < limit:
+                break
+        except Exception:
+            break
+
+    if len(all_bars) < 200:
+        return None
+
+    df = pd.DataFrame(all_bars, columns=[
+        'open_time', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'quote_volume', 'trades', 'taker_buy_base',
+        'taker_buy_quote', 'ignore'
+    ])
+    for col in ['open', 'high', 'low', 'close', 'volume', 'taker_buy_quote', 'quote_volume', 'trades']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+    df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+    df.set_index('open_time', inplace=True)
+    df = df[~df.index.duplicated(keep='last')].sort_index()
+    
+    # Keep only OHLCV + taker columns
+    keep = ['open', 'high', 'low', 'close', 'volume']
+    available = [c for c in keep if c in df.columns]
+    result = df[available]
+
+    # Cache it
+    OHLCV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    result.to_parquet(cache_path)
+    print(f"  💾 Cached {len(result)} 1h bars → {cache_path}")
+    return result
+
 
 def _acquire_cache_lock(symbol: str) -> bool:
     """Try to acquire exclusive write lock for a symbol's cache file.
@@ -463,12 +544,14 @@ def compute_5m_features_5tf(
     for_inference: bool = False,
     available_until: Optional[int] = None,
     market_data: Optional[Dict] = None,
+    df_1h: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Simplified feature computation: 5m execution + 1h predictive features.
     
-    Based on MI analysis: only 1h features have predictive power.
-    5m/15m/4h features contribute zero MI — removed to eliminate noise.
+    Uses DIRECT 1h OHLCV from Binance (fetched independently from 5m data).
+    This eliminates look-ahead bias — each 1h bar is a complete historical entity.
+    Training, validation, and inference all use the SAME methodology.
     
     2 timeframes used: 5m (timing/alignment), 1h (prediction).
     
@@ -476,40 +559,64 @@ def compute_5m_features_5tf(
         df_5m: 5m OHLCV DataFrame
         target_candle: Number of 5m candles forward to predict (default: 8 = 40 min)
         target_threshold: Return threshold for binary target (default: 0.003 = 0.3%)
-        intervals: Timeframes to resample (default: ['1h'])
+        intervals: Timeframes to compute (default: ['1h'])
         for_inference: If True, skips target column
         available_until: If set, simulates live conditions with limited data
+        market_data: Optional dict of market data (funding rate, OI, etc.)
+        df_1h: Optional pre-fetched 1h OHLCV (NO resampling from 5m)
+               If provided, used directly — eliminates look-ahead bias.
+               If None (legacy), falls back to resample_to_timeframes (WARNING: look-ahead possible)
     """
     if intervals is None:
         intervals = ['1h']  # Only 1h — 5m/15m/30m/4h had zero MI
 
-    # ── Per-bar mode: use data subset for 1h resampling ──
+    # ── Per-bar mode: use data subset for 5m features ──
     per_bar = available_until is not None
     if per_bar:
-        # 5m features use FULL df_5m (trailing indicators only — no look-ahead)
-        # Only 1h features need the data boundary
-        df_5m_full = df_5m.copy()
-        df_5m_for_1h = df_5m.iloc[:available_until + 1].copy()
+        df_5m_full = df_5m.copy()  # 5m features use FULL data (trailing — safe)
     else:
         df_5m_full = df_5m
-        df_5m_for_1h = df_5m
 
-    # Step 1: Resample 5m to higher timeframes
-    # (resample_to_timeframes now drops ALL incomplete bars via vectorized check)
-    tf_data = resample_to_timeframes(df_5m_for_1h, intervals)
+    # Step 1: Get 1h OHLCV — DIRECT from Binance (NO resampling from 5m)
+    # This is the CRITICAL fix: 1h features must use independent 1h data
+    # to eliminate look-ahead bias from 5m→1h resampling.
+    if df_1h is None:
+        # Legacy fallback: resample 5m to 1h (⚠️ WARNING: look-ahead possible!)
+        tf_data = resample_to_timeframes(df_5m, intervals)
+        tf_data['5m'] = df_5m_full
+    else:
+        # NEW: use independent 1h data — each bar is a complete historical entity
+        tf_data = {'5m': df_5m_full, '1h': df_1h.copy()}
 
-    # Recompute 5m features from FULL data (safe — trailing indicators only)
-    tf_data['5m'] = df_5m_full  # override 5m with full dataset
+        # In per-bar mode: only use 1h bars that were COMPLETE at cutoff time
+        if per_bar:
+            cutoff_time = df_5m_full.index[available_until]
+            # A 1h bar at index T is complete at T + 1h
+            df_1h_filtered = df_1h[df_1h.index + timedelta(hours=1) <= cutoff_time].copy()
+            if len(df_1h_filtered) > 0:
+                tf_data['1h'] = df_1h_filtered
+            else:
+                # No complete 1h bars yet — empty 1h features
+                tf_data['1h'] = pd.DataFrame(index=df_1h.index[:0])
+        
+        # For inference: also drop the incomplete current 1h bar
+        if for_inference and not per_bar:
+            cutoff_time = datetime.utcnow()
+            df_1h_filtered = df_1h[df_1h.index + timedelta(hours=1) <= cutoff_time].copy()
+            if len(df_1h_filtered) > 0:
+                tf_data['1h'] = df_1h_filtered
+            else:
+                tf_data['1h'] = pd.DataFrame(index=df_1h.index[:0])
 
     # During inference, additional safeguard: drop remaining incomplete bars
-    # relative to current UTC time (resample_to_timeframes already handles
-    # the data boundary, but this catches edge cases)
     if for_inference:
         for name, df_tf in tf_data.items():
             if name == '5m':
                 continue
             if len(df_tf) == 0:
                 continue
+            if df_1h is not None and name == '1h':
+                continue  # already filtered above
             last_bar_close = df_tf.index[-1] + timedelta(hours=1)
             if last_bar_close > datetime.utcnow():
                 tf_data[name] = df_tf.iloc[:-1]
@@ -525,8 +632,7 @@ def compute_5m_features_5tf(
         if name == '5m':
             continue
         if len(df_tf) == 0:
-            # No complete 1h bars yet (first 12 bars of 5m data)
-            other_feats[name] = pd.DataFrame(index=df_5m_for_1h.index)
+            other_feats[name] = pd.DataFrame(index=feats_5m.index)
             continue
         prefix_map = {'1h': 'h1_'}
         prefix = prefix_map.get(name, f'{name}_')
@@ -553,11 +659,11 @@ def compute_5m_features_5tf(
     
     combined = pd.concat(feat_list, axis=1)
     
-    # Step 4: Cross-timeframe features (5m ↔ 1h)
-    # In per-bar mode: cross-TF features only use data up to available_until
+    # ── Cross-timeframe features (use proper data cutoff for per-bar mode) ──
     if per_bar:
-        df_5m_trunc = df_5m_full.iloc[:available_until + 1].copy()
-        idx_xtf = [df_5m_trunc.index[-1]]  # only return the current bar
+        df_5m_cross = df_5m_full.iloc[:available_until + 1].copy()
+        df_5m_trunc = df_5m_cross
+        idx_xtf = [df_5m_cross.index[-1]]
     elif for_inference:
         # Existing logic: align to last non-NaN row
         valid_mask = combined.notna().all(axis=1)
@@ -570,9 +676,11 @@ def compute_5m_features_5tf(
         else:
             df_5m_trunc = df_5m.copy()
             idx_xtf = idx_5m
+        df_5m_cross = df_5m_trunc
     else:
         df_5m_trunc = df_5m.copy()
         idx_xtf = idx_5m
+        df_5m_cross = df_5m
     
     close_5m = df_5m_trunc['close'].astype(float) if len(df_5m_trunc) > 0 else pd.Series(dtype=float)
     volume_5m = df_5m_trunc['volume'].astype(float) if len(df_5m_trunc) > 0 else pd.Series(dtype=float)
@@ -602,15 +710,15 @@ def compute_5m_features_5tf(
         xtf['rsi_div_5m_vs_1h'] = feats_5m['m5_rsi_14'].reindex(idx_xtf) - rsi_1h_aligned
         
         # Volume ratio
-        vol_1h_avg = df_5m_for_1h['volume'].astype(float).rolling(12).sum().resample('1h').mean()
+        vol_1h_avg = df_5m_cross['volume'].astype(float).rolling(12).sum().resample('1h').mean()
         vol_1h_avg_aligned = vol_1h_avg.reindex(idx_xtf, method='ffill', limit=12)
         xtf['vol_5m_vs_1h_avg'] = volume_5m / vol_1h_avg_aligned.replace(0, np.nan)
         
         # Consolidation detection
-        range_5m_20 = (df_5m_full['high'].astype(float).rolling(20).max()  # rolling on FULL 5m (safe)
-                       - df_5m_full['low'].astype(float).rolling(20).min())
-        range_1h_20 = (df_5m_for_1h['high'].astype(float).resample('1h').max().rolling(20).mean()  # only available data
-                       - df_5m_for_1h['low'].astype(float).resample('1h').min().rolling(20).mean())
+        range_5m_20 = (df_5m_cross['high'].astype(float).rolling(20).max()
+                       - df_5m_cross['low'].astype(float).rolling(20).min())
+        range_1h_20 = (df_5m_cross['high'].astype(float).resample('1h').max().rolling(20).mean()
+                       - df_5m_cross['low'].astype(float).resample('1h').min().rolling(20).mean())
         range_1h_20_aligned = range_1h_20.reindex(idx_xtf, method='ffill', limit=12)
         xtf['consolidation_ratio'] = range_5m_20.reindex(idx_xtf) / range_1h_20_aligned.replace(0, np.nan)
         xtf['is_consolidating'] = (range_5m_20.reindex(idx_xtf) < range_5m_20.reindex(idx_xtf).rolling(40).mean() * 0.5).astype(float)
@@ -870,10 +978,22 @@ def prepare_ml_dataset(
     except Exception as e:
         print(f"  ⚠️ Market data fetch error: {e}")
 
+    # Fetch 1h OHLCV DIRECTLY — NO resampling from 5m (eliminates look-ahead bias)
+    df_1h = None
+    if '1h' in intervals:
+        try:
+            print(f"  Fetching 1h OHLCV directly from Binance (no look-ahead)...")
+            df_1h = ensure_ohlcv_1h(symbol, min_days=max(days // 24, 30))
+            if df_1h is not None:
+                print(f"    {symbol}: {len(df_1h)} bars of 1h data")
+        except Exception as e:
+            print(f"  ⚠️ 1h data fetch error: {e}")
+
     combined = compute_5m_features_5tf(df_5m, target_candle=target_candle,
                                        target_threshold=target_threshold,
                                        intervals=intervals,
-                                       market_data=market_data)
+                                       market_data=market_data,
+                                       df_1h=df_1h)
 
     # Save to cache
     combined.to_parquet(cache_path)

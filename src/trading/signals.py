@@ -284,7 +284,14 @@ class SignalGenerator:
 
             print(f"    ✅ OHLCV: {len(df_5m)} bars (cached incremental)")
             print(f"    🔧 Computing features...")
-            feat_df = compute_5m_features_5tf(df_5m, for_inference=True)
+            
+            # Fetch 1h OHLCV directly (NO look-ahead from resampling)
+            from src.strategies.ml_features import ensure_ohlcv_1h
+            df_1h = ensure_ohlcv_1h(symbol, min_days=30)
+            if df_1h is not None:
+                print(f"    ✅ 1h: {len(df_1h)} bars (independent cache)")
+            
+            feat_df = compute_5m_features_5tf(df_5m, for_inference=True, df_1h=df_1h)
 
             if len(feat_df) == 0:
                 print(f"    ⚠️ No feature rows for {symbol}")
