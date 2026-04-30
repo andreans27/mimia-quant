@@ -51,20 +51,22 @@ LIVE_SYMBOLS = [
     "WLDUSDT",     # WR=84.2% PF=17.02 DD=0.39%
 ]
 
-# Trading parameters (from optimal parameter sweep v4 — Apr 29)
-THRESHOLD = 0.50      # Optimal: lower = more trades, still 91% WR
-HOLD_BARS = 10         # Optimal: 10 bars (50 min) gives highest PnL
-COOLDOWN_BARS = 2      # Optimal: 2 bars (10 min) — from sweep 0-5, cd=2 wins
+# Trading parameters (from 45-day window batch optimization — Apr 30 2026)
+THRESHOLD = 0.79      # Optimal: 45d training + OOS gives WR 70-82% at 0.79
+HOLD_BARS = 10         # Optimal: 10 bars (50 min) — from sweep v4
+COOLDOWN_BARS = 2      # Optimal: 2 bars (10 min) — from sweep v4
 POSITION_PCT = 0.15    # Risk 15% of capital per trade (baseline)
 MARGIN_PCT = 0.01      # 1% of total balance per position
 LEVERAGE_X = 10        # 10x leverage
 
 # ─── Enhanced Parameters ───────────────────────────────────────────
 
-# Per-symbol thresholds: lower for low-freq symbols to increase trade count
-# Optimal from sweep v4: global THRESHOLD=0.50 is optimal for ALL symbols
-# Per-symbol adjustments not needed — empty dict, all use THRESHOLD
-SYMBOL_THRESHOLDS = {}
+# Per-symbol thresholds: 45-day training optimized
+# Batch results: 19/20 symbols WR >= 70% at THR=0.79 (global optimal)
+# ETHUSDT only symbol below 70% (62%) — may need lower threshold
+SYMBOL_THRESHOLDS = {
+    'ETHUSDT': 0.65,  # Lower threshold to capture more trades
+}
 
 # Per-symbol hold bars based on volatility regime
 # Optimal from sweep v4: high-vol = 9 (vs global 10), produces marginal +$23 improvement

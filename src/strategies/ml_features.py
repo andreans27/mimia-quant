@@ -177,7 +177,9 @@ def _fetch_5m_public_klines(symbol: str, days: int = 120) -> Optional[pd.DataFra
     df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
     df.set_index('open_time', inplace=True)
     df = df[~df.index.duplicated(keep='last')].sort_index()
-    return df[['open', 'high', 'low', 'close', 'volume']]
+    # Keep ALL columns: OHLCV + taker_buy data (available from Binance klines)
+    df['taker_buy_quote'] = pd.to_numeric(df.get('taker_buy_quote', 0), errors='coerce').fillna(0)
+    return df[['open', 'high', 'low', 'close', 'volume', 'taker_buy_quote']]
 
 
 def resample_to_timeframes(
@@ -219,30 +221,33 @@ def resample_to_timeframes(
             continue
 
         # Proper OHLCV resample — NOT interpolation
-        resampled = df_5m.resample(rule).agg({
+        agg_dict = {
             'open': 'first',
             'high': 'max',
             'low': 'min',
             'close': 'last',
             'volume': 'sum',
-        }).dropna()
+        }
+        # Include taker_buy_quote if available (sum aggregates across bars)
+        if 'taker_buy_quote' in df_5m.columns:
+            agg_dict['taker_buy_quote'] = 'sum'
+
+        resampled = df_5m.resample(rule).agg(agg_dict).dropna()
 
         # Ensure OHLC consistency: low <= open, close <= high
         resampled['low'] = resampled[['open', 'close', 'low']].min(axis=1)
         resampled['high'] = resampled[['open', 'close', 'high']].max(axis=1)
 
-        # CRITICAL FIX: Drop the LAST bar of each higher TF if it may be incomplete.
+        # CRITICAL FIX: Drop ALL higher-TF bars that may be incomplete.
         # Pandas resample creates a bar as soon as ANY data in that window exists.
-        # At inference time, e.g. at 14:30, the 4h bar 12:00-16:00 contains only
-        # 5m data from 12:00-14:30 — its close/volume is NOT final.
+        # At inference time, e.g. at 14:30, the 1h bar 14:00-15:00 contains only
+        # 5m data from 14:00-14:30 — its close/volume is NOT final.
         # This causes features to change each time new 5m data arrives!
-        # Only drop when the last bar end time > the LAST timestamp in df_5m
-        # (meaning the bar window extends beyond available data).
+        # A bar at index t is complete iff the window [t, t+rule) is fully
+        # contained within the available 5m data, i.e. t+rule <= last_ts.
         last_ts = df_5m.index[-1]
-        bar_end = resampled.index[-1] + pd.Timedelta(rule)
-        if bar_end > last_ts:
-            # Last bar is incomplete — drop it
-            resampled = resampled.iloc[:-1]
+        bar_close = resampled.index + pd.Timedelta(rule)
+        resampled = resampled[bar_close <= last_ts]
 
         result[name] = resampled
     
@@ -380,9 +385,67 @@ def compute_technical_features(df: pd.DataFrame, prefix: str = "", drop_raw: boo
 
     # Drop raw OHLCV columns to avoid duplicates across timeframes (if requested)
     if drop_raw:
-        for col in ["open", "high", "low", "close", "volume"]:
+        for col in ["open", "high", "low", "close", "volume", "taker_buy_quote"]:
             if col in result.columns:
                 del result[col]
+
+    # ── ENHANCED FEATURES v2 ─────────────────────────────────────
+    # Chaikin Money Flow (CMF, 20)
+    mfv = ((close - low) - (high - close)) / (high - low).replace(0, np.nan) * volume
+    cmf20 = mfv.rolling(20).sum() / volume.rolling(20).sum().replace(0, np.nan)
+    result[f"{p}cmf_20"] = cmf20
+
+    # Money Flow Index (MFI, 14)
+    tp = (high + low + close) / 3
+    mf = tp * volume
+    mf_pos = mf.where(tp > tp.shift(1), 0).rolling(14).sum()
+    mf_neg = mf.where(tp < tp.shift(1), 0).rolling(14).sum()
+    mfr = mf_pos / mf_neg.replace(0, np.nan)
+    result[f"{p}mfi_14"] = 100 - (100 / (1 + mfr))
+
+    # Elder's Force Index (13)
+    result[f"{p}force_idx_13"] = (close - close.shift(1)) * volume
+
+    # Williams %R (14)
+    high14 = high.rolling(14).max()
+    low14 = low.rolling(14).min()
+    result[f"{p}williams_r_14"] = -100 * (high14 - close) / (high14 - low14).replace(0, np.nan)
+
+    # Keltner %B (20, 2 ATR)
+    ema20 = close.ewm(span=20).mean()
+    kc_upper = ema20 + 2 * result[f"{p}atr_14"]
+    kc_lower = ema20 - 2 * result[f"{p}atr_14"]
+    result[f"{p}kc_pct_b"] = (close - kc_lower) / (kc_upper - kc_lower).replace(0, np.nan)
+    result[f"{p}kc_width"] = (kc_upper - kc_lower) / ema20.replace(0, np.nan)
+
+    # Volatility Z-Score (current ATR vs 50-period ATR)
+    atr14 = result[f"{p}atr_14"]
+    result[f"{p}vol_zscore"] = (atr14 - atr14.rolling(50).mean()) / atr14.rolling(50).std().replace(0, np.nan)
+
+    # Rolling Sharpe (20 bars)
+    ret_1 = close.pct_change()
+    result[f"{p}roll_sharpe_20"] = ret_1.rolling(20).mean() / ret_1.rolling(20).std().replace(0, np.nan)
+
+    # Efficiency Ratio (10): directionality / noise
+    price_move = abs(close - close.shift(10))
+    noise = (abs(close - close.shift(1))).rolling(10).sum().replace(0, np.nan)
+    result[f"{p}efficiency_ratio_10"] = price_move / noise
+
+    # Rolling Correlation: close vs volume (20)
+    result[f"{p}corr_close_vol_20"] = close.rolling(20).corr(volume)
+
+    # Net Volume Intensity: (close > open → +volume, close < open → -volume)
+    net_vol = volume.where(close > open_p, -volume).cumsum()
+    result[f"{p}net_vol_intensity"] = net_vol
+    result[f"{p}net_vol_sma_20"] = net_vol.rolling(20).mean()
+    result[f"{p}net_vol_ratio"] = net_vol / net_vol.rolling(20).mean().replace(0, np.nan)
+
+    # Acceleration: 2nd derivative of price
+    result[f"{p}acceleration"] = close.diff().diff()
+
+    # Price ROC with multiple periods
+    for period in [5, 10, 20]:
+        result[f"{p}roc_{period}"] = (close / close.shift(period) - 1) * 100
 
     return result
 
@@ -390,8 +453,11 @@ def compute_technical_features(df: pd.DataFrame, prefix: str = "", drop_raw: boo
 def compute_5m_features_5tf(
     df_5m: pd.DataFrame,
     target_candle: int = 9,
+    target_threshold: float = 0.005,
     intervals: Optional[List[str]] = None,
-    for_inference: bool = False
+    for_inference: bool = False,
+    available_until: Optional[int] = None,
+    market_data: Optional[Dict] = None,
 ) -> pd.DataFrame:
     """
     Simplified feature computation: 5m execution + 1h predictive features.
@@ -401,29 +467,67 @@ def compute_5m_features_5tf(
     
     2 timeframes used: 5m (timing/alignment), 1h (prediction).
     
-    When for_inference=True: skips target column, keeps most recent rows.
-    
-    Returns:
-        DataFrame with ~155 features (70 5m + 72 1h + 13 cross-TF) + 'target'.
+    Args:
+        df_5m: 5m OHLCV DataFrame
+        target_candle: Number of 5m candles forward to predict (default: 8 = 40 min)
+        target_threshold: Return threshold for binary target (default: 0.003 = 0.3%)
+        intervals: Timeframes to resample (default: ['1h'])
+        for_inference: If True, skips target column
+        available_until: If set, simulates live conditions with limited data
     """
     if intervals is None:
         intervals = ['1h']  # Only 1h — 5m/15m/30m/4h had zero MI
-    
+
+    # ── Per-bar mode: use data subset for 1h resampling ──
+    per_bar = available_until is not None
+    if per_bar:
+        # 5m features use FULL df_5m (trailing indicators only — no look-ahead)
+        # Only 1h features need the data boundary
+        df_5m_full = df_5m.copy()
+        df_5m_for_1h = df_5m.iloc[:available_until + 1].copy()
+    else:
+        df_5m_full = df_5m
+        df_5m_for_1h = df_5m
+
     # Step 1: Resample 5m to higher timeframes
-    tf_data = resample_to_timeframes(df_5m, intervals)
+    # (resample_to_timeframes now drops ALL incomplete bars via vectorized check)
+    tf_data = resample_to_timeframes(df_5m_for_1h, intervals)
+
+    # Recompute 5m features from FULL data (safe — trailing indicators only)
+    tf_data['5m'] = df_5m_full  # override 5m with full dataset
+
+    # During inference, additional safeguard: drop remaining incomplete bars
+    # relative to current UTC time (resample_to_timeframes already handles
+    # the data boundary, but this catches edge cases)
+    if for_inference:
+        for name, df_tf in tf_data.items():
+            if name == '5m':
+                continue
+            if len(df_tf) == 0:
+                continue
+            last_bar_close = df_tf.index[-1] + timedelta(hours=1)
+            if last_bar_close > datetime.utcnow():
+                tf_data[name] = df_tf.iloc[:-1]
+                print(f"    ⚠️ Dropped incomplete {name} bar: {df_tf.index[-1]}")
     
     # Step 2: Compute technical features on 5m (timing) and 1h (prediction)
     feats_5m = compute_technical_features(tf_data['5m'], prefix='m5_')
-    print(f"    Features computed: 5m = {len(feats_5m.columns)}")
+    if not per_bar:
+        print(f"    Features computed: 5m = {len(feats_5m.columns)}")
     
     other_feats = {}
     for name, df_tf in tf_data.items():
         if name == '5m':
             continue
+        if len(df_tf) == 0:
+            # No complete 1h bars yet (first 12 bars of 5m data)
+            other_feats[name] = pd.DataFrame(index=df_5m_for_1h.index)
+            continue
         prefix_map = {'1h': 'h1_'}
         prefix = prefix_map.get(name, f'{name}_')
         other_feats[name] = compute_technical_features(df_tf, prefix=prefix)
-        print(f"    Features computed: {name} = {len(other_feats[name].columns)}")
+        if not per_bar:
+            print(f"    Features computed: {name} = {len(other_feats[name].columns)}")
     
     # Step 3: Align 1h to 5m index via forward-fill
     idx_5m = feats_5m.index
@@ -435,82 +539,213 @@ def compute_5m_features_5tf(
     feat_list = [feats_5m]
     for name, df_feat in other_feats.items():
         limit = fill_limits.get(name, 12)
-        aligned = df_feat.reindex(idx_5m, method='ffill', limit=limit)
+        if len(df_feat) == 0:
+            # No 1h features — create empty aligned DataFrame
+            aligned = pd.DataFrame(index=idx_5m, columns=[])
+        else:
+            aligned = df_feat.reindex(idx_5m, method='ffill', limit=limit)
         feat_list.append(aligned)
     
     combined = pd.concat(feat_list, axis=1)
     
     # Step 4: Cross-timeframe features (5m ↔ 1h)
-    if for_inference:
-        # Align to last row where all features are non-NaN
+    # In per-bar mode: cross-TF features only use data up to available_until
+    if per_bar:
+        df_5m_trunc = df_5m_full.iloc[:available_until + 1].copy()
+        idx_xtf = [df_5m_trunc.index[-1]]  # only return the current bar
+    elif for_inference:
+        # Existing logic: align to last non-NaN row
         valid_mask = combined.notna().all(axis=1)
         if valid_mask.any():
             last_valid_idx = combined.index[valid_mask][-1]
             last_pos = combined.index.get_loc(last_valid_idx)
             df_5m_trunc = df_5m[df_5m.index <= last_valid_idx].copy()
             combined = combined.iloc[:last_pos + 1].copy()
-            idx_5m = combined.index
+            idx_xtf = combined.index
         else:
             df_5m_trunc = df_5m.copy()
+            idx_xtf = idx_5m
     else:
         df_5m_trunc = df_5m.copy()
+        idx_xtf = idx_5m
     
-    close_5m = df_5m_trunc['close'].astype(float)
-    volume_5m = df_5m_trunc['volume'].astype(float)
+    close_5m = df_5m_trunc['close'].astype(float) if len(df_5m_trunc) > 0 else pd.Series(dtype=float)
+    volume_5m = df_5m_trunc['volume'].astype(float) if len(df_5m_trunc) > 0 else pd.Series(dtype=float)
     
-    xtf = pd.DataFrame(index=idx_5m)
+    xtf = pd.DataFrame(index=idx_xtf)
     
-    # 1h Trend regime
-    if '1h' in tf_data:
+    # 1h Trend regime — use only available 1h data (per_bar supports it)
+    has_1h_ohlcv = '1h' in tf_data and len(tf_data['1h']) > 0
+    if has_1h_ohlcv:
         tf_close = tf_data['1h']['close'].astype(float)
         for period in [20, 50]:
             sma = tf_close.rolling(period).mean()
             trend = pd.Series(0, index=tf_close.index)
             trend[sma > sma.shift(1)] = 1
             trend[sma < sma.shift(1)] = -1
-            aligned = trend.reindex(idx_5m, method='ffill', limit=fill_limits.get('1h', 12))
+            aligned = trend.reindex(idx_xtf, method='ffill', limit=fill_limits.get('1h', 12))
             xtf[f'h1_trend_sma{period}'] = aligned
     
-    if '1h' in other_feats:
+    has_1h_feats = '1h' in other_feats and len(other_feats['1h']) > 0
+    if has_1h_feats:
         # Volatility ratio: 5m ATR vs 1h ATR
-        atr_1h_aligned = other_feats['1h']['h1_atr_14'].reindex(idx_5m, method='ffill', limit=12)
-        xtf['vol_ratio_5m_vs_1h'] = feats_5m['m5_atr_14'] / atr_1h_aligned.replace(0, np.nan)
+        atr_1h_aligned = other_feats['1h']['h1_atr_14'].reindex(idx_xtf, method='ffill', limit=12)
+        xtf['vol_ratio_5m_vs_1h'] = feats_5m['m5_atr_14'].reindex(idx_xtf) / atr_1h_aligned.replace(0, np.nan)
         
         # RSI divergence 5m vs 1h
-        rsi_1h_aligned = other_feats['1h']['h1_rsi_14'].reindex(idx_5m, method='ffill', limit=12)
-        xtf['rsi_div_5m_vs_1h'] = feats_5m['m5_rsi_14'] - rsi_1h_aligned
+        rsi_1h_aligned = other_feats['1h']['h1_rsi_14'].reindex(idx_xtf, method='ffill', limit=12)
+        xtf['rsi_div_5m_vs_1h'] = feats_5m['m5_rsi_14'].reindex(idx_xtf) - rsi_1h_aligned
         
         # Volume ratio
-        vol_1h_avg = df_5m['volume'].astype(float).rolling(12).sum().resample('1h').mean()
-        vol_1h_avg_aligned = vol_1h_avg.reindex(idx_5m, method='ffill', limit=12)
+        vol_1h_avg = df_5m_for_1h['volume'].astype(float).rolling(12).sum().resample('1h').mean()
+        vol_1h_avg_aligned = vol_1h_avg.reindex(idx_xtf, method='ffill', limit=12)
         xtf['vol_5m_vs_1h_avg'] = volume_5m / vol_1h_avg_aligned.replace(0, np.nan)
         
         # Consolidation detection
-        range_5m_20 = (tf_data['5m']['high'].astype(float).rolling(20).max() 
-                       - tf_data['5m']['low'].astype(float).rolling(20).min())
-        range_1h_20 = (df_5m['high'].astype(float).resample('1h').max().rolling(20).mean()
-                       - df_5m['low'].astype(float).resample('1h').min().rolling(20).mean())
-        range_1h_20_aligned = range_1h_20.reindex(idx_5m, method='ffill', limit=12)
-        xtf['consolidation_ratio'] = range_5m_20 / range_1h_20_aligned.replace(0, np.nan)
-        xtf['is_consolidating'] = (range_5m_20 < range_5m_20.rolling(40).mean() * 0.5).astype(float)
+        range_5m_20 = (df_5m_full['high'].astype(float).rolling(20).max()  # rolling on FULL 5m (safe)
+                       - df_5m_full['low'].astype(float).rolling(20).min())
+        range_1h_20 = (df_5m_for_1h['high'].astype(float).resample('1h').max().rolling(20).mean()  # only available data
+                       - df_5m_for_1h['low'].astype(float).resample('1h').min().rolling(20).mean())
+        range_1h_20_aligned = range_1h_20.reindex(idx_xtf, method='ffill', limit=12)
+        xtf['consolidation_ratio'] = range_5m_20.reindex(idx_xtf) / range_1h_20_aligned.replace(0, np.nan)
+        xtf['is_consolidating'] = (range_5m_20.reindex(idx_xtf) < range_5m_20.reindex(idx_xtf).rolling(40).mean() * 0.5).astype(float)
         
         # 1h bullish alignment
         close_1h = tf_data['1h']['close'].astype(float)
         trend_bull = (close_1h > close_1h.rolling(20).mean()).astype(int)
-        xtf['1h_bullish'] = trend_bull.reindex(idx_5m, method='ffill', limit=fill_limits.get('1h', 12))
+        xtf['1h_bullish'] = trend_bull.reindex(idx_xtf, method='ffill', limit=fill_limits.get('1h', 12))
     
     # ── Combine ALL features ──
     combined = pd.concat([combined, xtf], axis=1)
+
+    # ── TAKER BUY RATIO FEATURES (from OHLCV taker_buy_quote) ──────────
+    # taker_buy_quote is now preserved in df_5m cache — available for ALL training data
+    if 'taker_buy_quote' in df_5m_full.columns:
+        close_full = df_5m_full['close'].astype(float)
+        taker_quote = df_5m_full['taker_buy_quote'].astype(float).fillna(0)
+        volume_full = df_5m_full['volume'].astype(float).fillna(0)
+
+        # taker_buy_ratio: % of volume that was aggressive buying (0-1)
+        total_quote = close_full * volume_full
+        taker_buy_ratio = taker_quote / total_quote.replace(0, np.nan)
+        taker_buy_ratio = taker_buy_ratio.fillna(0.5).clip(0, 1)  # 0.5 = neutral
+
+        # Align to combined index
+        tbr = taker_buy_ratio.reindex(combined.index)
+
+        combined['taker_buy_ratio'] = tbr
+        # Rolling stats
+        for w in [12, 24, 48, 96, 192]:  # 1h, 2h, 4h, 8h, 16h at 5m
+            combined[f'taker_buy_ratio_sma_{w}'] = tbr.rolling(w, min_periods=5).mean()
+            combined[f'taker_buy_ratio_zscore_{w}'] = (
+                (tbr - tbr.rolling(w, min_periods=5).mean())
+                / tbr.rolling(w, min_periods=5).std().replace(0, np.nan)
+            ).fillna(0)
+        # Extreme buying/selling signals
+        combined['taker_buy_extreme'] = (tbr > 0.75).astype(float)   # heavy buying
+        combined['taker_sell_extreme'] = (tbr < 0.25).astype(float)  # heavy selling
+
+    # ── MARKET DATA FEATURES (Funding Rate, OI, Top Trader) ────────────
+    # These are fetched from cache and aligned to 5m index
+    try:
+        from src.strategies.market_data_cache import (
+            ensure_all_market_data, align_to_5m, compute_market_features
+        )
+
+        if market_data is None:
+            # Auto-fetch from cache (fast — parquet files)
+            market_data = ensure_all_market_data(
+                # We don't have symbol here, but that's fine — cache files exist
+                # For training, market_data is passed in from prepare_ml_dataset
+            )
+            market_data = None  # can't auto-fetch without symbol
+
+        if market_data is not None:
+            idx_5m_aligned = combined.index
+
+            # Funding Rate Features
+            fr_df = market_data.get('funding_rate')
+            if fr_df is not None and len(fr_df) > 0:
+                fr_aligned = align_to_5m(fr_df, idx_5m_aligned)
+                fr_feats = compute_market_features(fr_aligned, prefix='fr_')
+                # Add to combined (only columns that don't already exist)
+                for col in fr_feats.columns:
+                    if col not in combined.columns:
+                        combined[col] = fr_feats[col].values
+
+            # Open Interest Features
+            oi_df = market_data.get('open_interest')
+            if oi_df is not None and len(oi_df) > 0:
+                oi_aligned = align_to_5m(oi_df, idx_5m_aligned)
+                oi_feats = compute_market_features(oi_aligned, prefix='oi_')
+                for col in oi_feats.columns:
+                    if col not in combined.columns:
+                        combined[col] = oi_feats[col].values
+
+                # OI-Price divergence (smart money signal)
+                if 'close' in df_5m_full.columns and 'oi_sumOpenInterest' in oi_aligned.columns:
+                    close_full = df_5m_full['close'].astype(float).reindex(idx_5m_aligned)
+                    oi_val = pd.to_numeric(oi_aligned['sumOpenInterest'], errors='coerce').reindex(idx_5m_aligned)
+                    # 24-period (2h) correlation between price and OI
+                    oi_price_corr = close_full.rolling(24).corr(oi_val)
+                    combined['oi_price_corr_24'] = oi_price_corr.fillna(0)
+                    # Negative corr = divergence (bearish if price up, OI down)
+                    combined['oi_price_divergence'] = (oi_price_corr < -0.5).astype(float)
+
+            # Top Trader Account Ratio Features
+            top_df = market_data.get('top_trader_account')
+            if top_df is not None and len(top_df) > 0:
+                top_aligned = align_to_5m(top_df, idx_5m_aligned)
+                top_feats = compute_market_features(top_aligned, prefix='top_')
+                for col in top_feats.columns:
+                    if col not in combined.columns:
+                        combined[col] = top_feats[col].values
+
+            # Top Trader Position Ratio Features
+            topp_df = market_data.get('top_trader_position')
+            if topp_df is not None and len(topp_df) > 0:
+                topp_aligned = align_to_5m(topp_df, idx_5m_aligned)
+                topp_feats = compute_market_features(topp_aligned, prefix='topp_')
+                for col in topp_feats.columns:
+                    if col not in combined.columns:
+                        combined[col] = topp_feats[col].values
+
+    except ImportError:
+        pass  # market_data_cache not available — skip these features
+    except Exception as e:
+        print(f"    ⚠️ Market data features error: {e}")
+        pass  # non-fatal — continue without market features
+
+    # ── Time-based features (computed once at 5m level) ──
+    if for_inference or not for_inference:
+        idx_hour = combined.index.hour
+        idx_minute = combined.index.minute
+        # Session encoding: Asia 0-8, Euro 8-16, US 16-24
+        session = pd.Series(0, index=combined.index)
+        session[(idx_hour >= 0) & (idx_hour < 8)] = -1    # Asia
+        session[(idx_hour >= 8) & (idx_hour < 16)] = 0    # Euro
+        session[(idx_hour >= 16)] = 1                     # US
+        combined['session'] = session
+        # Sin/cos encoding of time
+        hour_angle = 2 * np.pi * (idx_hour + idx_minute / 60) / 24
+        combined['hour_sin'] = np.sin(hour_angle)
+        combined['hour_cos'] = np.cos(hour_angle)
+        # Day of week
+        combined['day_of_week'] = combined.index.dayofweek / 6.0  # normalize 0-1
     
-    # ── Target: dual — LONG predicts UP > 0.5%, SHORT predicts DOWN > 0.5% ──
+    # ── Target: dual — LONG predicts UP > threshold, SHORT predicts DOWN > threshold ──
     if not for_inference:
-        ret_10bar = close_5m.shift(-(target_candle + 1)) / close_5m.shift(-1) - 1
-        combined['target_long'] = (ret_10bar > 0.005).astype(float)
-        combined['target_short'] = (ret_10bar < -0.005).astype(float)
+        ret_nbar = close_5m.shift(-(target_candle + 1)) / close_5m.shift(-1) - 1
+        combined['target_long'] = (ret_nbar > target_threshold).astype(float)
+        combined['target_short'] = (ret_nbar < -target_threshold).astype(float)
         combined['target'] = combined['target_long']  # default/backward compat
     
     # ── Drop NaN rows ──
-    if for_inference:
+    if per_bar:
+        # Per-bar mode: return single row (no truncation needed)
+        combined = combined.loc[[df_5m_trunc.index[-1]]].copy()
+        pass  # single row, no NaN rows to worry about
+    elif for_inference:
         combined = combined.iloc[200:].copy()
         now = datetime.utcnow()
         last_idx = combined.index[-1]
@@ -522,7 +757,8 @@ def compute_5m_features_5tf(
     else:
         combined = combined.iloc[200:-(target_candle + 1)].copy()
         print(f"    Total features: {len([c for c in combined.columns if c != 'target'])} + target")
-    print(f"    Rows: {len(combined)}")
+    if not per_bar:
+        print(f"    Rows: {len(combined)}")
     
     return combined
 
@@ -531,7 +767,8 @@ def prepare_ml_dataset(
     symbol: str,
     days: int = 120,
     cache_dir: str = "data/ml_cache",
-    target_candle: int = 9,
+    target_candle: int = 8,
+    target_threshold: float = 0.003,
     intervals: Optional[List[str]] = None,
     side: str = 'long'
 ) -> Tuple[pd.DataFrame, pd.Series, pd.DatetimeIndex]:
@@ -542,15 +779,16 @@ def prepare_ml_dataset(
         symbol: Trading pair e.g. 'BTCUSDT'
         days: How many days of historical data to fetch
         cache_dir: Cache directory
-        target_candle: Number of 5m candles forward to predict
+        target_candle: Number of 5m candles forward to predict (default: 8 = 40 min)
+        target_threshold: Return threshold for binary target (default: 0.003 = 0.3%)
         intervals: Timeframes to resample and compute features on
-        side: 'long' (UP > 0.5%) or 'short' (DOWN > 0.5%)
+        side: 'long' (UP > threshold) or 'short' (DOWN > threshold)
     
     Returns:
         (X, y, index) or (None, None, None) on failure
     """
     if intervals is None:
-        intervals = ['15m', '30m', '1h', '4h']
+        intervals = ['1h']
 
     # Cache key: differentiate from old 15m-based cache
     tf_suffix = '_'.join(sorted(intervals))
@@ -576,7 +814,23 @@ def prepare_ml_dataset(
 
     print(f"    {symbol}: {len(df_5m)} bars of 5m data (shared cache)")
     print(f"  Computing features across {len(intervals)} timeframes for {symbol}...")
-    combined = compute_5m_features_5tf(df_5m, target_candle=target_candle, intervals=intervals)
+
+    # Fetch market data (funding rate, OI, top trader) — cached, fast
+    market_data = None
+    try:
+        from src.strategies.market_data_cache import ensure_all_market_data
+        print(f"  Fetching market data (funding rate, OI, top trader)...")
+        market_data = ensure_all_market_data(symbol)
+        if market_data:
+            for k, v in market_data.items():
+                print(f"    {k}: {len(v) if v is not None else 0} records")
+    except Exception as e:
+        print(f"  ⚠️ Market data fetch error: {e}")
+
+    combined = compute_5m_features_5tf(df_5m, target_candle=target_candle,
+                                       target_threshold=target_threshold,
+                                       intervals=intervals,
+                                       market_data=market_data)
 
     # Save to cache
     combined.to_parquet(cache_path)
@@ -640,4 +894,5 @@ def _fetch_all_klines(client, symbol: str, interval: str, start_ms: int, end_ms:
     df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
     df.set_index('open_time', inplace=True)
     df = df[~df.index.duplicated(keep='last')].sort_index()
-    return df[['open', 'high', 'low', 'close', 'volume']]
+    df['taker_buy_quote'] = pd.to_numeric(df.get('taker_buy_quote', 0), errors='coerce').fillna(0)
+    return df[['open', 'high', 'low', 'close', 'volume', 'taker_buy_quote']]
